@@ -1,18 +1,21 @@
 #!/bin/bash
 sl="/etc/letsencrypt"
 fnz="${sl}.zip"
-s3b=${S3_BUILD_BUCKET:-mg-build-pipeline-secure}
+s3b=${S3_BUCKET}
 s3z="s3://${s3b}/letsencrypt.zip"
+
+if [[ -z "$s3b" ]]; then
+  # echo "[Warn] no S3 bucket for letsencrypt"
+  exit 0
+fi
 
 link_cert() {
   install="$1"
   fn="$2"
   ap=$(find "$sl/archive/${install}" -name "${fn}*.pem" -type f)
-  if [[ -z "$ap" ]]; then
-    echo "No certificate archive for $install $fn"
-  else
+  if [[ ! -z "$ap" ]]; then
     lp="$sl/live/${install}/${fn}.pem"
-    echo "link $fn at $lp"
+    # echo "link $fn at $lp"
     rm -rf $lp
     ln -s "$ap" "$lp"
   fi
@@ -28,10 +31,10 @@ if [[ $1 = "backup" ]]; then
   aws s3 cp "$fnz" "$s3z" --sse AES256
 elif [[ $1 = "restore" ]]; then
   if [[ -d "$sl/live" ]]; then
-    echo "$sl/live is already present."
+    # echo "$sl/live is already present."
     exit 0
   fi
-  echo "Restoring $fnz from $s3z..."
+  # echo "Restoring $fnz from $s3z..."
   mkdir -p "$sl"
   aws s3 cp "$s3z" "$fnz"
   unzip -q -o "$fnz" -d "$sl"
@@ -43,19 +46,6 @@ elif [[ $1 = "restore" ]]; then
     link_cert "$install" "cert"
     link_cert "$install" "fullchain"
     link_cert "$install" "privkey"
-    # echo "examining $dir for $install"
-    # find "$dir/*" | while read lp
-    # do
-    #   fn=$(basename "$lp" | cut -d. -f1)
-    #   ap=$(find "$sl/archive/${install}" -name "${fn}*.pem" -type f)
-    #   echo "found $fn with $ap"
-    #   if [[ -z "$ap" ]]; then
-    #     continue
-    #   fi
-    #   echo "link $fn at $lp"
-    #   rm -rf $lp
-    #   ln -s "$ap" "$lp"
-    # done
   done
 else
   echo "Unknown mode: $1"

@@ -1,11 +1,12 @@
-Switchboard
+# Switchboard
 ----
 
-General Options
+# Installation
 ----
 
-Virtual Host Configuration
-----
+## Simple Example
 
-Cluster Configuration
-----
+## Ingress
+
+## Egress
+

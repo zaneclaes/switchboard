@@ -1,14 +1,16 @@
 #!/bin/bash
-sleep 3 # Give kube2iam a second.
 
+echo "--------------------------------------------------------"
+echo "Switchboard Startup"
+echo "--------------------------------------------------------"
 echo "configuring envoy..."
-python3 /usr/local/bin/switchboard.py # generates envoy.yaml
-if [[ "${loglevel}" = "debug" ]]; then
+python3.7 /usr/local/bin/switchboard.py # generates envoy.yaml
+if [[ "${LOG_LEVEL}" = "debug" ]]; then
   echo "Generated Envoy YAML:"
   echo "$(cat envoy.yaml)"
 fi
-cp envoy.yaml /etc/envoy.yaml
 
-echo "starting envoy..."
-/usr/local/bin/envoy -l ${loglevel:-info} --log-path ${logpath:-/dev/stdout} -c /etc/envoy.yaml &
-wait
+cmd="$@ -l ${LOG_LEVEL:-info} --log-path ${LOG_PATH:-/dev/stdout}"
+echo "starting $cmd..."
+echo "--------------------------------------------------------"
+$cmd
