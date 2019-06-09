@@ -12,5 +12,4 @@ RUN pip3 install certbot_dns_route53 awscli configparser cffi
 
 ADD bin /usr/local/bin
 
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-CMD ["envoy", "-c", "envoy.yaml"]
+ENTRYPOINT ["/usr/local/bin/switchboard.py"]

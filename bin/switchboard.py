@@ -1,16 +1,18 @@
-#!/usr/bin/env python
+#!/usr/bin/python3.7
 import yaml, json, configparser, os, subprocess, re, logging
 from collections import defaultdict
 
 domain_tls = {}
 
-def _file_access_log(router_name, path = "/dev/stdout"):
+def _file_access_log(router_name):
+  if len(cfg['log_path']) > 0: log_path = '%s/%s.log' % (cfg['log_path'], router_name)
+  else: log_path = '/dev/stdout'
   return {
     "name": "envoy.file_access_log",
     "config": {
       # https://www.envoyproxy.io/docs/envoy/latest/configuration/access_log#config-access-log-format-dictionaries
       # Optimized for Datadog logging.
-      "path": path,
+      "path": log_path,
       "json_format": {
           "@timestamp": "%START_TIME%",
           "processor": "net",
@@ -38,10 +40,7 @@ def _file_access_log(router_name, path = "/dev/stdout"):
 def sh(cmd, print_cmd = True):
   proc = subprocess.Popen(cmd, shell=True)
   comm = proc.communicate()
-
-  if proc.returncode != 0:
-    raise Exception('[Shell] [ERROR]', comm)
-
+  if proc.returncode != 0:  raise Exception('[Shell] [ERROR]', comm)
   return comm[0]
 
 # Route traffic (within a virtual host) to a specific cluster.
@@ -264,8 +263,10 @@ re_egress_matcher = re.compile(re_egress)
 
 if __name__ == "__main__":
   cfg = {
-    'log_format': '[%(asctime)s] [%(process)d] [%(levelname)s] [%(name)s] %(message)s',
+    'log_format_switchboard': '[%(asctime)s] [%(process)d] [%(levelname)s] [%(name)s] %(message)s',
+    'log_format_envoy': "",
     'log_level': 'INFO',
+    'log_path': '',
     'bind_address': '0.0.0.0',
     'admin_port': 5000,
     'http_port': 8080,
@@ -280,7 +281,14 @@ if __name__ == "__main__":
   for var_name in cfg:
     cfg[var_name] = os.getenv(var_name.upper(), cfg[var_name])
 
-  logging.basicConfig(format=cfg['log_format'], level=cfg['log_level'])
+  envoy_flags = ['-c', '/etc/envoy/envoy.yaml']
+  if len(cfg['log_path']) > 0:
+    fn = '%s/switchboard.log' % cfg['log_path']
+    envoy_flags += ['--log-path', '%s/envoy.log' % cfg['log_path']]
+    logging.basicConfig(filename=fn, format=cfg['log_format_switchboard'], level=cfg['log_level'])
+  else:
+    envoy_flags += ['--log-path', '/dev/stdout']
+    logging.basicConfig(format=cfg['log_format_switchboard'], level=cfg['log_level'])
 
   ingress_values = get_uniq_config_values('ingress')
   logging.debug(f"Ingress Regex: {re_ingress}")
@@ -392,5 +400,12 @@ if __name__ == "__main__":
 
   resources = { 'listeners': listeners, 'clusters': list(dest_clusters.values()) }
   data = { "static_resources": resources, "admin": _admin() }
-  with open('envoy.yaml', 'w') as outfile:
+  sh('mkdir -p /etc/envoy')
+  with open('/etc/envoy/envoy.yaml', 'w') as outfile:
     yaml.dump(data, outfile, default_flow_style=False)
+
+  if cfg['log_level'].upper() != 'INFO': envoy_flags += ['-l', cfg['log_level']]
+  if len(cfg['log_format_envoy']) > 0: envoy_flags += ['--log-format', cfg['log_format_envoy']]
+  cmd = f'envoy ' + ' '.join(envoy_flags)
+  logging.debug(f'Starting envoy with command: {cmd}')
+  sh(cmd)
