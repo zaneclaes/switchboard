@@ -4,38 +4,58 @@ from collections import defaultdict
 
 domain_tls = {}
 
+# --------------------------------------------------------------------------------------------------
+# Regex Definitions
+# --------------------------------------------------------------------------------------------------
+def _re_param(name, pattern):
+  return f"(?P<{name}>{pattern})"
+
+re_certbot_filename = _re_param("name", "\w+")
+re_certbot_version = _re_param("version", "\d+")
+re_certbot_pem_matcher = re.compile(f"^{re_certbot_filename}{re_certbot_version}\.pem$")
+
+# Ingress regex
+re_in_schema = "".join([
+  _re_param("schema", "\w+"),
+  _re_param("schema_opt", "\??"), # If ends with ?, listen on both secure and insecure
+  _re_param("schema_req", "\!?") # If ends with !, enforce this schema (redirect http to https)
+])
+re_in_subdomain = "".join([
+  _re_param("subdomain", "[a-z0-9-]*"),
+  _re_param("subdomain_opt", "\??"), # If ends with ?, also listen on no-subdomain version
+  _re_param("subdomain_no_shard", "\!?"), # If ends with !, consider final: do not apply sharding.
+])
+re_in_domain = _re_param("domain", "[\.a-z0-9-]+")
+re_in_path = "".join([
+  _re_param("path", "[\.\/a-z0-9-]*"),
+  _re_param("strip_path", "\!?") # If ends with !, strip the path prefix
+])
+re_in_dest = _re_param("dest", "[\.a-z0-9-]+")
+re_ingress = f"^{re_in_schema}://{re_in_subdomain}:{re_in_domain}{re_in_path}:{re_in_dest}$"
+re_in_matcher = re.compile(re_ingress)
+
+# Egress Regex
+re_eg_dest = _re_param("dest", "[a-z0-9-]+")
+re_eg_schema = _re_param("schema", "\w+")
+re_eg_domain = _re_param("domain", "[\.a-z0-9-]+")
+re_eg_port = _re_param("port", "[0-9]+")
+re_egress = f"^{re_eg_dest}:{re_eg_schema}://{re_eg_domain}:{re_eg_port}$"
+re_eg_matcher = re.compile(re_egress)
+
+# --------------------------------------------------------------------------------------------------
+
 def _file_access_log(router_name):
-  if len(cfg['log_path']) > 0: log_path = '%s/%s.log' % (cfg['log_path'], router_name)
-  else: log_path = '/dev/stdout'
-  return {
-    "name": "envoy.file_access_log",
-    "config": {
-      # https://www.envoyproxy.io/docs/envoy/latest/configuration/access_log#config-access-log-format-dictionaries
-      # Optimized for Datadog logging.
-      "path": log_path,
-      "json_format": {
-          "@timestamp": "%START_TIME%",
-          "processor": "net",
-          "router": router_name,
-          "duration": "%DURATION%",
-          "http.method": "%REQ(:METHOD)%",
-          "http.url": "%REQ(X-FORWARDED-PROTO)%://%REQ(:AUTHORITY)%%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%",
-          "http.protocol": "%PROTOCOL%",
-          "http.status_code": "%RESPONSE_CODE%",
-          "http.useragent": "%REQ(USER-AGENT)%",
-          "http.request_id": "%REQ(X-REQUEST-ID)%",
-          "http.response_flags": "%RESPONSE_FLAGS%",
-          "http.referer": "%REQ(REFERER)%",
-          "network.destination.ip": "%UPSTREAM_HOST%",
-          "network.destination.cluster": "%UPSTREAM_CLUSTER%",
-          "network.destination.duration": "%RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)%",
-          "network.client.ip": "%REQ(X-FORWARDED-FOR)%",
-          "network.bytes_read": "%BYTES_RECEIVED%",
-          "network.bytes_written": "%BYTES_SENT%",
-          "grpc_status": "%RESP(GRPC-STATUS)%"
-        }
-      }
-    }
+  ret = { "name": "envoy.file_access_log", "config": {} }
+  if len(cfg['log_path']) > 0: ret['config']['path'] = '%s/%s.log' % (cfg['log_path'], router_name)
+  else: ret['config']['path'] = '/dev/stdout'
+
+  if len(cfg['log_format_access']) > 0:
+    ret['config']['format'] = cfg['log_format_access'].replace('%ROUTER%', router_name)
+  elif len(cfg['log_format_access_json']) > 0:
+    ret['config']['json_format'] = json.loads(
+      cfg['log_format_access_json'].replace('%ROUTER%', router_name))
+
+  return ret
 
 def sh(cmd, print_cmd = True):
   proc = subprocess.Popen(cmd, shell=True)
@@ -51,22 +71,27 @@ def _match_route(dest_schema, path_prefix = '/', match_options = {}):
   ret['prefix'] = path_prefix
   return ret
 
-def _match_routes_egress(listener_schema, dest_name, route_options = {}):
+def _match_routes_egress(listener_schema, dest_name, path_prefix = '/', route_options = {}):
   if '.' in dest_name:
     log.info(f"match egress host_redirect {listener_schema} to {dest_name}")
-    return [{ 'match': _match_route(listener_schema), 'redirect': { 'host_redirect': dest_name } }]
+    return [{
+      'match': _match_route(listener_schema, path_prefix),
+      'redirect': { 'host_redirect': dest_name }
+    }]
   if not dest_name in dest_schemas:
     raise Exception(f"{dest_name} was not registered as an egress point")
   routes = []
   for dest_schema in dest_schemas[dest_name]:
     cluster_name = f"{dest_schema}-{dest_name}"
-    match = _match_route(dest_schema)
     if not cluster_name in dest_clusters:
       raise Exception(f"{cluster_name} was not a redirection or cluster")
     log.info(f"match egress route {listener_schema} to cluster {dest_schema}://{cluster_name}")
     route = dict(route_options)
     route['cluster'] = cluster_name
-    routes.append({ 'match': _match_route(dest_schema), 'route': route })
+    routes.append({
+      'match': _match_route(dest_schema, path_prefix),
+      'route': route
+    })
   return routes
 
 def _certificate(domain):
@@ -75,11 +100,35 @@ def _certificate(domain):
     return domain_tls[domain]
 
   le_dir = '/etc/letsencrypt'
+  fnz = '/etc/letsencrypt.zip'
+  s3z = f"s3://{cfg['s3_bucket']}/letsencrypt.zip" if len(cfg['s3_bucket']) > 0 else None
   if not os.path.isdir(le_dir):
     logging.warn(f"skipping _certificate for {domain}")
     return {}
-  if not os.path.isdir(f'{le_dir}/renewal'):
-    sh('/usr/local/bin/certsync.sh restore')
+  if s3z and not os.path.isdir(f'{le_dir}/renewal'):
+    logging.info(f'restoring certificates from {s3z}')
+    sh(f'aws s3 cp "{s3z}" "{fnz}"')
+    sh(f'unzip -q -o "{fnz}" -d "{le_dir}"')
+    for dname in os.listdir(f'{le_dir}/live'): # Enumerate the sites in the live directory
+      live_dir = os.path.join(f'{le_dir}/live', dname)
+      archive_dir = f'{le_dir}/archive/{dname}'
+      if not os.path.isdir(live_dir): continue
+      logging.info(f'linking certificates for {dname}')
+      file_versions = defaultdict(int)
+      # Enumerate all files in the archive and get the latest version for each
+      for fname in os.listdir(archive_dir):
+        match = re_certbot_pem_matcher.match(fname)
+        if not match: continue
+        v = int(match.group('version'))
+        if v < file_versions[match.group('name')]: continue
+        file_versions[match.group('name')] = v
+      # Symlink the latest versions of the files
+      for fname in file_versions:
+        v = file_versions[fname]
+        src = f'{archive_dir}/{fname}{v}.pem'
+        dst = f'{live_dir}/{fname}.pem'
+        logging.debug(f'symlinking {src} to {dst}')
+        sh(f'rm -rf {dst} && ln -s "{src}" "{dst}"')
 
   email = cfg['email']
   if len(email) <= 0:
@@ -100,14 +149,16 @@ def _certificate(domain):
 
   if not os.path.isdir('/etc/letsencrypt/live/' + domain):
     raise Exception("Failed to get a certificate for " + domain)
-  # Back up with every cert creation, so that intermediate progress is saved
-  # In the case there are lots of certs, this can be a useful trait if containers
-  # are killed by some health check daemon.
-  with open('/var/log/letsencrypt/letsencrypt.log', 'r') as lf:
-    log = lf.read()
-    if not "not yet due" in log:
-      logging.info(f"backing up certbot")
-      sh('/usr/local/bin/certsync.sh backup')
+  if s3z:
+    # Back up with every cert creation, so that intermediate progress is saved
+    # In the case there are lots of certs, this can be a useful trait if containers
+    # are killed by some health check daemon.
+    with open('/var/log/letsencrypt/letsencrypt.log', 'r') as lf:
+      log = lf.read()
+      if not "not yet due" in log:
+        logging.info(f"backing up letsencrypt to {s3z}")
+        sh(f'cd {le_dir} && zip -r -q --exclude="*.DS_Store*" "{fnz}" .')
+        sh(f'aws s3 cp "{fnz}" "{s3z}" --sse AES256')
   os.rename('/var/log/letsencrypt/letsencrypt.log', '/var/log/letsencrypt/%s.log' % domain)
   domain_tls[domain] = {
     "certificate_chain": { "filename": "/etc/letsencrypt/live/%s/fullchain.pem" % domain },
@@ -172,10 +223,12 @@ def _socket_address(address, port):
   return { 'socket_address': { 'address': address, 'port_value': port } }
 
 def _ingress_address(ingress_type):
-  return _socket_address(cfg['bind_address'], cfg[f"{ingress_type}_port"])
+  return _socket_address(cfg['bind_address'], val2int(cfg[f"{ingress_type}_port"]))
 
 def _admin():
-  return { 'access_log_path': '/dev/stdout', 'address': _ingress_address('admin') }
+  if len(cfg['log_path']) > 0: log_path = '%s/envoy_admin.log' % cfg['log_path']
+  else: log_path = '/dev/stdout'
+  return { 'access_log_path': log_path, 'address': _ingress_address('admin') }
 
 def _endpoints(address, port):
   return { 'lb_endpoints': [{'endpoint': { 'address': _socket_address(address, port) } }] }
@@ -215,12 +268,18 @@ def _listener(schema, filter_chains):
     listener['listener_filters'] += [{'name': 'envoy.listener.tls_inspector', 'config': {}}]
   return listener
 
-# --------------------------------
+# --------------------------------------------------------------------------------------------------
 # Main
-# --------------------------------
+# --------------------------------------------------------------------------------------------------
 def str2list(string):
   if type(string) is list: return string
   return [x.strip() for x in re.split(r'(\s+)', string) if x.strip()]
+
+def val2int(val):
+  if type(val) is int: return val
+  if not type(val) is str: raise Exception(f'{val} is not an int or string')
+  if len(val) <= 0: return 0
+  return int(val)
 
 # Combine an environment variable with the contents of any files into a single set of values
 # i.e., passing 'ingress' will look at the INGRESS env. var and /etc/switchboard/ingress/**
@@ -234,39 +293,16 @@ def get_uniq_config_values(name):
         ret = ret.union(set(str2list(f.read())))
   return ret
 
-def _re_param(name, pattern):
-  return f"(?P<{name}>{pattern})"
-
-# Ingress regex
-re_ingress_schema = "".join([
-  _re_param("schema", "\w+"),
-  _re_param("schema_opt", "\??"), # If ends with ?, listen on both secure and insecure
-  _re_param("schema_req", "\!?") # If ends with !, enforce this schema (redirect http to https)
-])
-re_ingress_subdomain = "".join([
-  _re_param("subdomain", "[a-z0-9-]*"),
-  _re_param("subdomain_opt", "\??"), # If ends with ?, also listen on no-subdomain version
-  _re_param("subdomain_no_shard", "\!?"), # If ends with !, consider final: do not apply sharding.
-])
-re_ingress_domain = _re_param("domain", "[\.a-z0-9-]*")
-re_ingress_dest = _re_param("dest", "[\.a-z0-9-]+")
-re_ingress = f"^{re_ingress_schema}://{re_ingress_subdomain}:{re_ingress_domain}:{re_ingress_dest}$"
-re_ingress_matcher = re.compile(re_ingress)
-
-# Egress Regex
-re_egress_dest = _re_param("dest", "[a-z0-9-]+")
-re_egress_schema = _re_param("schema", "\w+")
-re_egress_domain = _re_param("domain", "[\.a-z0-9-]*")
-re_egress_port = _re_param("port", "[0-9]+")
-re_egress = f"^{re_egress_dest}:{re_egress_schema}://{re_egress_domain}:{re_egress_port}$"
-re_egress_matcher = re.compile(re_egress)
 
 if __name__ == "__main__":
-  cfg = {
+  defcfg = {
     'log_format_switchboard': '[%(asctime)s] [%(process)d] [%(levelname)s] [%(name)s] %(message)s',
-    'log_format_envoy': "",
+    'log_format_access': '',
+    'log_format_access_json': '',
+    'log_format_envoy': '',
     'log_level': 'INFO',
     'log_path': '',
+    's3_bucket': '',
     'bind_address': '0.0.0.0',
     'admin_port': 5000,
     'http_port': 8080,
@@ -275,11 +311,13 @@ if __name__ == "__main__":
     'shard': '',
     'email': '',
   }
+  cfg = dict(defcfg)
   if os.path.isfile('/etc/switchboard/config.yml'):
     with open('/etc/switchboard/config.yml', 'r') as stream:
       cfg.update(yaml.safe_load(stream))
   for var_name in cfg:
     cfg[var_name] = os.getenv(var_name.upper(), cfg[var_name])
+    if type(defcfg[var_name]) is int: cfg[var_name] = val2int(cfg[var_name])
 
   envoy_flags = ['-c', '/etc/envoy/envoy.yaml']
   if len(cfg['log_path']) > 0:
@@ -303,7 +341,7 @@ if __name__ == "__main__":
   dest_schemas = defaultdict(set)
   for dest_str in destinations:
     log = logging.getLogger(f"<egress>{dest_str}")
-    dest_match = re_egress_matcher.match(dest_str)
+    dest_match = re_eg_matcher.match(dest_str)
     if not dest_match:
       raise Exception(f"No regex match for egress config str: {dest_str}")
 
@@ -331,7 +369,7 @@ if __name__ == "__main__":
 
   for ingress_str in ingress_values: # Iterate virtual hosts
     log = logging.getLogger(f"<ingress>{ingress_str}")
-    ingress_match = re_ingress_matcher.match(ingress_str)
+    ingress_match = re_in_matcher.match(ingress_str)
     if not ingress_match:
       raise Exception(f"No regex match for ingress config str: {ingress_str}")
 
@@ -339,7 +377,10 @@ if __name__ == "__main__":
     domain = ingress_match.group('domain')
     fqdns = _get_fqdns(ingress_match)
     dest_name = ingress_match.group('dest')
+    path = ingress_match.group('path') if len(ingress_match.group('path')) > 0 else '/'
     filter_config = {}
+    route_options = {}
+    if ingress_match.group('strip_path'): route_options['prefix_rewrite'] = '/'
     if ingress_schema_str == 'wss': # Allow for simple upgrading of connection when HTTPS
       filter_config['upgrade_configs'] = [{ 'upgrade_type': 'websocket' }]
       ingress_schema_str = 'https'
@@ -359,7 +400,7 @@ if __name__ == "__main__":
 
     for listener_schema in ingress_schemas:
       log.info(f"ingress {listener_schema} {fqdns} => {dest_name}")
-      routes = _match_routes_egress(listener_schema, dest_name)
+      routes = _match_routes_egress(listener_schema, dest_name, path, route_options)
 
       log.debug(f'listener {listener_schema} with routes {routes}')
       if listener_schema == 'https':
@@ -399,13 +440,15 @@ if __name__ == "__main__":
   if len(listeners) <= 0: raise Exception("No listeners created.")
 
   resources = { 'listeners': listeners, 'clusters': list(dest_clusters.values()) }
-  data = { "static_resources": resources, "admin": _admin() }
+  data = { "static_resources": resources }
+  if cfg['admin_port'] > 0: data['admin'] = _admin()
   sh('mkdir -p /etc/envoy')
   with open('/etc/envoy/envoy.yaml', 'w') as outfile:
     yaml.dump(data, outfile, default_flow_style=False)
 
-  if cfg['log_level'].upper() != 'INFO': envoy_flags += ['-l', cfg['log_level']]
-  if len(cfg['log_format_envoy']) > 0: envoy_flags += ['--log-format', cfg['log_format_envoy']]
+  if cfg['log_level'].upper() != 'INFO': envoy_flags += ['-l', cfg['log_level'].lower()]
+  if len(cfg['log_format_envoy']) > 0:
+    envoy_flags += ['--log-format', "\"" + cfg['log_format_envoy'] + "\""]
   cmd = f'envoy ' + ' '.join(envoy_flags)
   logging.debug(f'Starting envoy with command: {cmd}')
   sh(cmd)
