@@ -64,20 +64,21 @@ def sh(cmd, print_cmd = True):
   return comm[0]
 
 # Route traffic (within a virtual host) to a specific cluster.
-def _match_route(dest_schema, path_prefix = '/', match_options = {}):
-  ret = dict(match_options)
+def _match_route(base, dest_schema, prefix = '/', match_options = {}):
+  ret = dict(base)
+  ret['match'] = dict(match_options)
   if dest_schema == 'grpc':
-    ret['headers'] = { "name": "content-type", "exact_match": "application/grpc" }
-  ret['prefix'] = path_prefix
+    ret['match']['headers'] = { "name": "content-type", "exact_match": "application/grpc" }
+  ret['match']['prefix'] = prefix
   return ret
+
+def _match_redirect(redirect, dest_schema, prefix = '/', match_options = {}):
+  return _match_route({ 'redirect': redirect }, dest_schema, prefix, match_options)
 
 def _match_routes_egress(listener_schema, dest_name, path_prefix = '/', route_options = {}):
   if '.' in dest_name:
     log.info(f"match egress host_redirect {listener_schema} to {dest_name}")
-    return [{
-      'match': _match_route(listener_schema, path_prefix),
-      'redirect': { 'host_redirect': dest_name }
-    }]
+    return [_match_redirect({ 'host_redirect': dest_name }, listener_schema, path_prefix)]
   if not dest_name in dest_schemas:
     raise Exception(f"{dest_name} was not registered as an egress point")
   routes = []
@@ -88,10 +89,7 @@ def _match_routes_egress(listener_schema, dest_name, path_prefix = '/', route_op
     log.info(f"match egress route {listener_schema} to cluster {dest_schema}://{cluster_name}")
     route = dict(route_options)
     route['cluster'] = cluster_name
-    routes.append({
-      'match': _match_route(dest_schema, path_prefix),
-      'route': route
-    })
+    routes.append(_match_route({ 'route': route }, dest_schema, path_prefix))
   return routes
 
 def _certificate(domain):
@@ -386,7 +384,7 @@ if __name__ == "__main__":
       ingress_schema_str = 'https'
     if ingress_match.group('schema_req'): # Configure a http -> https redirect
       log.info(f"redirect to secure for {ingress_schema_str}{fqdns}")
-      routes = [{ 'match': _match_route('http'), 'redirect': { 'https_redirect': True } }]
+      routes = [_match_redirect({ 'https_redirect': True }, 'http', path)]
       listener_virtual_hosts['http'].append(_virtual_host(fqdns, routes))
       ingress_schema_str = 'https'
 
@@ -410,7 +408,7 @@ if __name__ == "__main__":
         listener_virtual_hosts[listener_schema].append(_virtual_host(fqdns, routes))
       else:
         raise Exception(f"do not know how to configure {listener_schema} routes")
-  # End Virtual Hosts
+  # [Ingress] End
 
   if len(cfg['default_route']) > 0:
     logging.info("Default HTTP Route: " + cfg['default_route'])
@@ -423,9 +421,9 @@ if __name__ == "__main__":
   listeners = []
   if len(https_filter_chains) > 0:
     # Redirect unmatched HTTPS back to HTTP...
-    route_http = { 'match': _match_route('https'), 'redirect': { 'scheme_redirect': 'http' } }
+    route_http = _match_redirect({ 'scheme_redirect': 'http' }, 'https')
     https_filter_chains += _vh_filter_chain_match('https', [_virtual_host(["*"], route_http)])
-    listeners += [_listener('https', https_filter_chains)]
+    listeners.append(_listener('https', https_filter_chains))
     logging.info("[bind] https://%s:%s" % (cfg['bind_address'], cfg['https_port']))
 
   for schema in listener_virtual_hosts:
