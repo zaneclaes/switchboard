@@ -43,9 +43,28 @@ Default values (in parenthesis).
 The `ingress` variable defines the domain names which Switchboard will listen upon. The value can be an array (in a YML file) or a string with each ingress value separated by any whitespace. It is required and each value takes the form of:
 `{schema}://{subdomain}:{domain}{path}:{destination}`
 
+### Schema
+
+The schema may be `http`, `https`, `ws`, or `wss`. For secure schemas, adding a `!` at the end will force the unsecure version to redirect to the secure. Alternatively, the `?` suffix is a conevenience to listent on both secure and unsecure schemas.
+
+### Subdomain
+
+This value may be empty if you do not wish to listen on a subdomain. You may also use the `?` suffix to listen on both the subdomain and the top level domain. For example, a value of `www?` would match for both `www.mydomain.com` and `mydomain.com`.
+
+### Domain
+
+The top-level domain name, such as `mydomain.com` or `some-domain.io`.
+
+### Path
+
+The `path` is optional, and will match only requests which begin with the specified path. If suffixed with a `!`, the path will be stripped before it is sent to the cluster. For example, a value of `/foo!` will mean that the destination will receive requests to `/foo/bar` as simply `/bar`.
+
+### Destination
+
 The `destination` can either be an `egress_name` or a fully-qualified domain name for redirection.
 
-Examples:
+### Examples
+
 * `https://www:mydomain.com:my-cluster`: Route `https://www.mydomain.com` to `my-cluster` (egress)
 * `http://www?:mydomain.com:google.com`: Redirect `http://www.mydomain.com` AND `http://mydomain.com` to `google.com`
 * `https!://:mydomain.com:my-cluster`: Force `https` and route `mydomain.com` to `my-cluster` (egress)

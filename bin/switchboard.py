@@ -197,18 +197,18 @@ def _filter_http_connection_manager(router_name, virtual_hosts = [], config = {}
     'use_remote_address': True,
     'access_log': [_file_access_log(router_name)],
     'http_filters': { 'name': 'envoy.router' },
-    'route_config': { 'virtual_hosts': virtual_hosts }
+    'route_config': { 'virtual_hosts': list(virtual_hosts) }
   })
-  return { 'name': 'envoy.http_connection_manager', 'config': config }
+  return { 'name': 'envoy.http_connection_manager', 'config': dict(config) }
 
-def _vh_filter_chain_match(router_name, virtual_hosts, config = {}):
+def _vh_filters(router_name, virtual_hosts = [], config = {}):
   return [{ 'filters': _filter_http_connection_manager(router_name, virtual_hosts, config) }]
 
-def _https_tls_filter_chain_match(fqdns, domain, routes, config = {}):
+def _secure_filter_chain(domain, fqdns):
   router_name = '-'.join(['https'] + fqdns)
   return {
     'filter_chain_match': { "server_names": fqdns },
-    'filters': _filter_http_connection_manager(router_name, [_virtual_host(fqdns, routes)], config),
+    'filters': [_filter_http_connection_manager(router_name)],
     'tls_context': {
       'common_tls_context': {
         'alpn_protocols': 'h2',
@@ -361,9 +361,9 @@ if __name__ == "__main__":
   # [Egress] End Routes
 
   # [Ingress] Build Virtual Hosts
-  listener_filter_chain_matches = { 'http': [], 'https': [] }
-  listener_virtual_hosts = { 'http': [], 'ws': [] }
-  https_filter_chains = []
+  secure_filter_chains = {}
+  secure_domain_routes = defaultdict(list)
+  unsecure_domain_routes = { 'http': defaultdict(list), 'ws': defaultdict(list) }
 
   for ingress_str in ingress_values: # Iterate virtual hosts
     log = logging.getLogger(f"<ingress>{ingress_str}")
@@ -374,6 +374,8 @@ if __name__ == "__main__":
     ingress_schema_str = ingress_match.group('schema')
     domain = ingress_match.group('domain')
     fqdns = _get_fqdns(ingress_match)
+    splitter = '|'
+    fqdns_str = splitter.join(fqdns)
     dest_name = ingress_match.group('dest')
     path = ingress_match.group('path') if len(ingress_match.group('path')) > 0 else '/'
     filter_config = {}
@@ -385,7 +387,8 @@ if __name__ == "__main__":
     if ingress_match.group('schema_req'): # Configure a http -> https redirect
       log.info(f"redirect to secure for {ingress_schema_str}{fqdns}")
       routes = [_match_redirect({ 'https_redirect': True }, 'http', path)]
-      listener_virtual_hosts['http'].append(_virtual_host(fqdns, routes))
+      for fqdn in fqdns:
+        unsecure_domain_routes['http'][fqdn] += routes
       ingress_schema_str = 'https'
 
     # Build a finalized set of schemas which will be listened upon
@@ -402,10 +405,12 @@ if __name__ == "__main__":
 
       log.debug(f'listener {listener_schema} with routes {routes}')
       if listener_schema == 'https':
-        https_filter_chains.append(
-          _https_tls_filter_chain_match(fqdns, domain, routes, filter_config))
-      elif listener_schema in listener_virtual_hosts:
-        listener_virtual_hosts[listener_schema].append(_virtual_host(fqdns, routes))
+        if not fqdns_str in secure_filter_chains:
+          secure_filter_chains[fqdns_str] = _secure_filter_chain(domain, fqdns)
+        secure_filter_chains[fqdns_str]['filters'][0]['config'].update(filter_config)
+        secure_domain_routes[fqdns_str] += routes
+      elif listener_schema in unsecure_domain_routes:
+        unsecure_domain_routes[listener_schema][fqdns_str] += routes
       else:
         raise Exception(f"do not know how to configure {listener_schema} routes")
   # [Ingress] End
@@ -413,26 +418,34 @@ if __name__ == "__main__":
   if len(cfg['default_route']) > 0:
     logging.info("Default HTTP Route: " + cfg['default_route'])
     routes = _match_routes_egress('http', cfg['default_route'])
-    listener_virtual_hosts['http'].append(_virtual_host(["*"], routes))
+    unsecure_domain_routes['http']['*'] += routes
 
-  logging.debug("virtual hosts: " + json.dumps(listener_virtual_hosts, indent=2))
-  logging.debug("filter chains: " + json.dumps(https_filter_chains, indent=2))
+  logging.debug("unsecure domain routes: " + json.dumps(unsecure_domain_routes, indent=2))
+  logging.debug("secure filter chains: " + json.dumps(secure_filter_chains , indent=2))
+  logging.debug("secure domain routes: " + json.dumps(secure_domain_routes, indent=2))
 
   listeners = []
-  if len(https_filter_chains) > 0:
+  if len(secure_filter_chains) > 0:
+    matches = []
+    for fqdns_str in secure_filter_chains:
+      match = secure_filter_chains[fqdns_str]
+      vh = _virtual_host(fqdns_str.split(splitter), secure_domain_routes[fqdns_str])
+      match['filters'][0]['config']['route_config']['virtual_hosts'].append(vh)
+      matches.append(match)
     # Redirect unmatched HTTPS back to HTTP...
     route_http = _match_redirect({ 'scheme_redirect': 'http' }, 'https')
-    https_filter_chains += _vh_filter_chain_match('https', [_virtual_host(["*"], route_http)])
-    listeners.append(_listener('https', https_filter_chains))
+    matches.append(_vh_filters('https', [_virtual_host(["*"], route_http)]))
+    listeners.append(_listener('https', matches))
     logging.info("[bind] https://%s:%s" % (cfg['bind_address'], cfg['https_port']))
 
-  for schema in listener_virtual_hosts:
-    if len(listener_virtual_hosts[schema]) <= 0: continue
-    vhs = listener_virtual_hosts[schema]
+  for schema in unsecure_domain_routes:
+    routes = unsecure_domain_routes[schema]
+    if len(routes) <= 0: continue
+    vhs = [_virtual_host(fqdns_str.split(splitter), routes[fqdns_str]) for fqdns_str in routes]
     filter_config = {}
     if schema == 'ws':
       filter_config['upgrade_configs'] = [{ 'upgrade_type': 'websocket' }]
-    listeners.append(_listener(schema, _vh_filter_chain_match(schema, vhs, filter_config)))
+    listeners.append(_listener(schema, _vh_filters(schema, vhs, filter_config)))
     logging.info("[bind] %s://%s:%s" % (schema, cfg['bind_address'], cfg['http_port']))
 
   if len(listeners) <= 0: raise Exception("No listeners created.")
