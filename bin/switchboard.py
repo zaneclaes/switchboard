@@ -153,7 +153,7 @@ def _certificate(domain):
     # are killed by some health check daemon.
     with open('/var/log/letsencrypt/letsencrypt.log', 'r') as lf:
       log = lf.read()
-      if not "not yet due" in log:
+      if "-BEGIN CERTIFICATE-" in log:
         logging.info(f"backing up letsencrypt to {s3z}")
         sh(f'cd {le_dir} && zip -r -q --exclude="*.DS_Store*" "{fnz}" .')
         sh(f'aws s3 cp "{fnz}" "{s3z}" --sse AES256')
