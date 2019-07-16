@@ -23,6 +23,12 @@ I have a Kubernetes deployment running in production which needs to route traffi
 
 Each of the Switchboard variables described below may be configured via YAML by mounting a file at `/etc/switchboard/config.yml`, or by providing an enviroment variable of the same name (except upper-case). For example, the `ingress` variable may be a string within the YML file, or an enviroment variable `INGRESS` (which takes precedence). The two strategies can be layered together, allowing for Kubernetes `kustomization` for different environments.
 
+## Sample Kubernetes Deployment
+
+See [https://gist.github.com/zaneclaes/4901f9a30baa119953c1f8074390cff9](my production deployment yaml).
+
+This example assumes `kube2iam` for AWS authentication in order to achieve the S3 backup-and-restore of certbot-generated certifiactes. It also tweaks the default logging formats to structured JSON, making it well suited for a variety of ingestion pipelines. Finally, it provides samples of readiness and liveness checks.
+
 ## Optional Settings
 
 Default values (in parenthesis).
