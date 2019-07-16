@@ -25,7 +25,7 @@ Each of the Switchboard variables described below may be configured via YAML by 
 
 ## Sample Kubernetes Deployment
 
-See [https://gist.github.com/zaneclaes/4901f9a30baa119953c1f8074390cff9](my production deployment yaml).
+See [my production deployment yaml](https://gist.github.com/zaneclaes/4901f9a30baa119953c1f8074390cff9).
 
 This example assumes `kube2iam` for AWS authentication in order to achieve the S3 backup-and-restore of certbot-generated certifiactes. It also tweaks the default logging formats to structured JSON, making it well suited for a variety of ingestion pipelines. Finally, it provides samples of readiness and liveness checks.
 
