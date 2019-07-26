@@ -31,7 +31,7 @@ re_in_path = "".join([
   _re_param("strip_path", "\!?") # If ends with !, strip the path prefix
 ])
 re_in_dest = _re_param("dest", "[\.a-z0-9-]+")
-re_ingress = f"^{re_in_schema}://{re_in_subdomain}:{re_in_domain}{re_in_path}:{re_in_dest}$"
+re_ingress = f"^{re_in_schema}://{re_in_subdomain}:{re_in_domain}{re_in_path}@{re_in_dest}$"
 re_in_matcher = re.compile(re_ingress)
 
 # Egress Regex
@@ -39,7 +39,7 @@ re_eg_dest = _re_param("dest", "[a-z0-9-]+")
 re_eg_schema = _re_param("schema", "\w+")
 re_eg_domain = _re_param("domain", "[\.a-z0-9-]+")
 re_eg_port = _re_param("port", "[0-9]+")
-re_egress = f"^{re_eg_dest}:{re_eg_schema}://{re_eg_domain}:{re_eg_port}$"
+re_egress = f"^{re_eg_dest}:{re_eg_schema}@{re_eg_domain}:{re_eg_port}$"
 re_eg_matcher = re.compile(re_egress)
 
 # --------------------------------------------------------------------------------------------------
@@ -190,15 +190,30 @@ def _virtual_host(fqdns, routes):
   return { "domains": fqdns, "name": "vh-" + fqdns[0], "routes": routes }
 
 def _filter_http_connection_manager(router_name, virtual_hosts = [], config = {}):
-  config.update({
+  def_cfg = {
     'codec_type': 'AUTO',
     'stat_prefix': 'ingress_http',
     'add_user_agent': True,
     'use_remote_address': True,
-    'access_log': [_file_access_log(router_name)],
-    'http_filters': { 'name': 'envoy.router' },
-    'route_config': { 'virtual_hosts': list(virtual_hosts) }
-  })
+    'access_log': [],
+    'http_filters': []
+  }
+  config = dict(config)
+  config.update(def_cfg)
+  config['access_log'].append(_file_access_log(router_name))
+  if len(cfg['ext_authz']) > 0:
+    config['http_filters'].append({
+      'name': 'envoy.ext_authz',
+      'config': {
+        'grpc_service': {
+          'envoy_grpc': {
+            'cluster_name': cfg['ext_authz']
+          },
+        }
+      }
+    })
+  config['http_filters'].append({ 'name': 'envoy.router' })
+  config['route_config'] = { 'virtual_hosts': list(virtual_hosts) }
   return { 'name': 'envoy.http_connection_manager', 'config': dict(config) }
 
 def _vh_filters(router_name, virtual_hosts = [], config = {}):
@@ -289,8 +304,7 @@ def get_uniq_config_values(name):
       if not os.path.isfile(os.path.join(d, fn)): continue
       with open(os.path.join(d, fn), 'r') as f:
         ret = ret.union(set(str2list(f.read())))
-  return ret
-
+  return [os.path.expandvars(x) for x in ret]
 
 if __name__ == "__main__":
   defcfg = {
@@ -308,6 +322,7 @@ if __name__ == "__main__":
     'default_route': '',
     'shard': '',
     'email': '',
+    'ext_authz': '',
   }
   cfg = dict(defcfg)
   if os.path.isfile('/etc/switchboard/config.yml'):
@@ -363,7 +378,8 @@ if __name__ == "__main__":
   # [Ingress] Build Virtual Hosts
   secure_filter_chains = {}
   secure_domain_routes = defaultdict(list)
-  unsecure_domain_routes = { 'http': defaultdict(list), 'ws': defaultdict(list) }
+  unsecure_domain_routes = defaultdict(list)
+  unsecure_web_sockets = False
 
   for ingress_str in ingress_values: # Iterate virtual hosts
     log = logging.getLogger(f"<ingress>{ingress_str}")
@@ -388,7 +404,7 @@ if __name__ == "__main__":
       log.info(f"redirect to secure for {ingress_schema_str}{fqdns}")
       routes = [_match_redirect({ 'https_redirect': True }, 'http', path)]
       for fqdn in fqdns:
-        unsecure_domain_routes['http'][fqdn] += routes
+        unsecure_domain_routes[fqdn] += routes
       ingress_schema_str = 'https'
 
     # Build a finalized set of schemas which will be listened upon
@@ -409,8 +425,11 @@ if __name__ == "__main__":
           secure_filter_chains[fqdns_str] = _secure_filter_chain(domain, fqdns)
         secure_filter_chains[fqdns_str]['filters'][0]['config'].update(filter_config)
         secure_domain_routes[fqdns_str] += routes
-      elif listener_schema in unsecure_domain_routes:
-        unsecure_domain_routes[listener_schema][fqdns_str] += routes
+      elif listener_schema == 'http':
+        unsecure_domain_routes[fqdns_str] += routes
+      elif listener_schema == 'ws':
+        unsecure_web_sockets = True
+        unsecure_domain_routes[fqdns_str] += routes
       else:
         raise Exception(f"do not know how to configure {listener_schema} routes")
   # [Ingress] End
@@ -418,7 +437,7 @@ if __name__ == "__main__":
   if len(cfg['default_route']) > 0:
     logging.info("Default HTTP Route: " + cfg['default_route'])
     routes = _match_routes_egress('http', cfg['default_route'])
-    unsecure_domain_routes['http']['*'] += routes
+    unsecure_domain_routes['*'] += routes
 
   logging.debug("unsecure domain routes: " + json.dumps(unsecure_domain_routes, indent=2))
   logging.debug("secure filter chains: " + json.dumps(secure_filter_chains , indent=2))
@@ -438,12 +457,11 @@ if __name__ == "__main__":
     listeners.append(_listener('https', matches))
     logging.info("[bind] https://%s:%s" % (cfg['bind_address'], cfg['https_port']))
 
-  for schema in unsecure_domain_routes:
-    routes = unsecure_domain_routes[schema]
-    if len(routes) <= 0: continue
-    vhs = [_virtual_host(fqdns_str.split(splitter), routes[fqdns_str]) for fqdns_str in routes]
+  if len(unsecure_domain_routes) > 0:
+    schema = 'http'
+    vhs = [_virtual_host(fqdns_str.split(splitter), unsecure_domain_routes[fqdns_str]) for fqdns_str in unsecure_domain_routes]
     filter_config = {}
-    if schema == 'ws':
+    if unsecure_web_sockets:
       filter_config['upgrade_configs'] = [{ 'upgrade_type': 'websocket' }]
     listeners.append(_listener(schema, _vh_filters(schema, vhs, filter_config)))
     logging.info("[bind] %s://%s:%s" % (schema, cfg['bind_address'], cfg['http_port']))

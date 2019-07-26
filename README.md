@@ -47,7 +47,7 @@ Default values (in parenthesis).
 ## Ingress
 
 The `ingress` variable defines the domain names which Switchboard will listen upon. The value can be an array (in a YML file) or a string with each ingress value separated by any whitespace. It is required and each value takes the form of:
-`{schema}://{subdomain}:{domain}{path}:{destination}`
+`{schema}://{subdomain}:{domain}{path}@{destination}`
 
 ### Schema
 
@@ -71,19 +71,24 @@ The `destination` can either be an `egress_name` or a fully-qualified domain nam
 
 ### Examples
 
-* `https://www:mydomain.com:my-cluster`: Route `https://www.mydomain.com` to `my-cluster` (egress)
-* `http://www?:mydomain.com:google.com`: Redirect `http://www.mydomain.com` AND `http://mydomain.com` to `google.com`
-* `https!://:mydomain.com:my-cluster`: Force `https` and route `mydomain.com` to `my-cluster` (egress)
-* `wss?://api:mydomain.com:my-cluster`: Support Web Socket upgrading on both `http` and `https` for `api.mydomain.com`, routed to `my-cluster`
+* `https://www:mydomain.com@my-cluster`: Route `https://www.mydomain.com` to `my-cluster` (egress)
+* `http://www?:mydomain.com@google.com`: Redirect `http://www.mydomain.com` AND `http://mydomain.com` to `google.com`
+* `https!://:mydomain.com@my-cluster`: Force `https` and route `mydomain.com` to `my-cluster` (egress)
+* `wss?://api:mydomain.com@my-cluster`: Support Web Socket upgrading on both `http` and `https` for `api.mydomain.com`, routed to `my-cluster`
 
 ## Egress
 
 The `egress` variable defines your Envoy clusters (servers) to route traffic to. The value can be an array (in a YML file) or a string with each egress value separated by any whitespace. It is required and each value takes the form of:
-`{egress_name}:{schema}://{address}:{port}`
+`{egress_name}:{schema}@{address}:{port}`
 
 The same `egress_name` can be used twice with both the `http` and `grpc` schemas in order to support both, in which case the `content-type` header value of `application/grpc` will be used to determine which destination to use. For example, the two values can be used together:
-* `my-cluster:http://localhost:5200`: Route regular HTTP traffic for `my-cluster` to `localhost:5200`
-* `my-cluster:grpc://localhost:5201`: Route GRPC traffic for `my-cluster` to `localhost:5201`
+
+* `my-cluster:http@localhost:5200`: Route regular HTTP traffic for `my-cluster` to `localhost:5200`
+* `my-cluster:grpc@localhost:5201`: Route GRPC traffic for `my-cluster` to `localhost:5201`
+
+You can also use environment variables to assist in congfiguration. For example, in Kubernetes, you might route to some `grafana` deployment as follows:
+
+* `grafana:http@$GRAFANA_SERVICE_HOST:$GRAFANA_SERVICE_PORT`
 
 ## Shard
 
