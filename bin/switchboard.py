@@ -189,7 +189,7 @@ def _get_fqdns(match):
 def _virtual_host(fqdns, routes):
   return { "domains": fqdns, "name": "vh-" + fqdns[0], "routes": routes }
 
-def _filter_http_connection_manager(router_name, virtual_hosts = [], config = {}):
+def _filter_http_connection_manager(router_name, virtual_hosts = [], base_config = {}):
   def_cfg = {
     'codec_type': 'AUTO',
     'stat_prefix': 'ingress_http',
@@ -198,23 +198,23 @@ def _filter_http_connection_manager(router_name, virtual_hosts = [], config = {}
     'access_log': [],
     'http_filters': []
   }
-  config = dict(config)
-  config.update(def_cfg)
-  config['access_log'].append(_file_access_log(router_name))
-  if len(cfg['ext_authz']) > 0:
+  config = dict(def_cfg)
+  config.update(base_config)
+  if cfg['auth_port'] > 0:
     config['http_filters'].append({
       'name': 'envoy.ext_authz',
       'config': {
         'grpc_service': {
           'envoy_grpc': {
-            'cluster_name': cfg['ext_authz']
+            'cluster_name': 'grpc-ext-authz'
           },
         }
       }
     })
+  config['access_log'].append(_file_access_log(router_name))
   config['http_filters'].append({ 'name': 'envoy.router' })
   config['route_config'] = { 'virtual_hosts': list(virtual_hosts) }
-  return { 'name': 'envoy.http_connection_manager', 'config': dict(config) }
+  return { 'name': 'envoy.http_connection_manager', 'config': config }
 
 def _vh_filters(router_name, virtual_hosts = [], config = {}):
   return [{ 'filters': _filter_http_connection_manager(router_name, virtual_hosts, config) }]
@@ -312,6 +312,7 @@ if __name__ == "__main__":
     'log_format_access': '',
     'log_format_access_json': '',
     'log_format_envoy': '',
+    'log_format_auth': '',
     'log_level': 'INFO',
     'log_path': '',
     's3_bucket': '',
@@ -319,10 +320,10 @@ if __name__ == "__main__":
     'admin_port': 5000,
     'http_port': 8080,
     'https_port': 8443,
+    'auth_port': 0,
     'default_route': '',
     'shard': '',
     'email': '',
-    'ext_authz': '',
   }
   cfg = dict(defcfg)
   if os.path.isfile('/etc/switchboard/config.yml'):
@@ -352,6 +353,14 @@ if __name__ == "__main__":
   # [Egress] Build Routes
   dest_clusters = {}
   dest_schemas = defaultdict(set)
+
+  # [Authorization] Start Go server?
+  if cfg['auth_port'] > 0:
+    logging.info('starting ext-authz on port #%s' % cfg['auth_port'])
+    destinations.append('ext-authz:grpc@localhost:%s' % cfg['auth_port'])
+    sh('/usr/local/bin/ext-authz %s %s %s &' % (
+      cfg['auth_port'], cfg['log_level'], cfg['log_format_auth']))
+
   for dest_str in destinations:
     log = logging.getLogger(f"<egress>{dest_str}")
     dest_match = re_eg_matcher.match(dest_str)

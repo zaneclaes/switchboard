@@ -1,3 +1,12 @@
+# https://github.com/jbarratt/envoy_ratelimit_example
+# https://serialized.net/2019/05/envoy-ratelimits/
+FROM golang:latest as builder
+COPY ./ext-authz /ext-authz
+WORKDIR /ext-authz
+ENV GO111MODULE=on
+RUN go get
+RUN CGO_ENABLED=0 GOOOS=linux go build -o ext-authz
+
 FROM envoyproxy/envoy:latest AS envoy
 
 RUN apt-get update && apt-get install -y software-properties-common
@@ -11,5 +20,6 @@ RUN curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py && \
 RUN pip3 install certbot_dns_route53 awscli configparser cffi
 
 ADD bin /usr/local/bin
+COPY --from=builder /ext-authz /usr/local/bin
 
 ENTRYPOINT ["/usr/local/bin/switchboard.py"]

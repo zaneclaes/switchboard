@@ -10,6 +10,7 @@ A simple-to-configure front proxy in a docker container, built on Envoy.
 * Web Sockets
 * HTTP->HTTPS redirection
 * Domain name redirection
+* Built-in authorization (`Basic` and `Bearer` HTTP authentication)
 * Sharding (different subdomains for different environments)
 * Automatic certificate generation via CertBot/LetsEncrypt
 * Stateless (certificate backup via S3)
@@ -36,12 +37,14 @@ Default values (in parenthesis).
 * `http_port`: The port to listen on for HTTP connections (`8080`)
 * `https_port`: The port to listen on for HTTPS connections (`8443`)
 * `admin_port`: The port for the Envoy admin interface (`5000`); an empty value will disable the admin interface.
+* `auth_port`: Enable `ext-authz` on the specified port (see: Authorizations)
 * `bind_address`: The address on which to listen (`0.0.0.0`)
 * `log_format_switchboard`: The Python `logger` format for Switchboard (`[%(asctime)s] [%(process)d] [%(levelname)s] [%(name)s] %(message)s`)
 * `log_format_envoy`: The Envoy application log format (empty = Envoy default)
 * `log_format_access`: The access log format for Envoy (empty = Envoy default)
 * `log_format_access_json`: The JSON access log format for Envoy (empty = Envoy default)
-* `log_level`: Used by both Switchboard and Envoy applications (`INFO`)
+* `log_format_auth`: either `text` or `json` (`text`)
+* `log_level`: Used by both Switchboard, Envoy, and Authorization applications (`INFO`)
 * `log_path`: The folder in which to write log files (empty = write to `/dev/stdout`)
 
 ## Ingress
@@ -102,3 +105,24 @@ Assuming that the value `dev` is provided, then the following will be true of in
 ## Certificate Generation
 
 If the `https` or `wss` schema is used for any ingress, and the `email` variable is provided, Switchboard will attempt to use LetsEncrypt to generate a certificate.
+
+## Authorization
+
+If the `auth_port` configuration is provided, Switchboard will automatically create a self-managed authorization server to protect access to given domains. It will look for yaml files in `/etc/switchboard/authorizations/` which match the domain name being accessed.
+
+Note: using the `authorization` feature automatically creates a GRPC cluster named `ext-authz`, powered by an internal Go server, and checks with this server before processing any request.
+
+### Examples
+
+`/etc/switchboard/authorizations/example.com.yaml`:
+```
+bearer: ['some_token']
+basic: ['dGVzdDoxMjM0']
+```
+
+Any requests to `example.com` will only be allowed to proceed with one of the two headers:
+
+* `Authorization: Bearer some_token` (a presumed access token)
+* `Authorization: Basic dGVzdDoxMjM0` (equivalent to `test:1234` as a username/password)
+
+Requests without these headers will be rejected. Successfull requests will have the `x-ext-auth-ratelimit` set to the sha256 of the token/authorization (for use in rate-limiting). Requests to other domains will succeed without challenge.
