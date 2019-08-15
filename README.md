@@ -5,19 +5,19 @@ A simple-to-configure front proxy in a docker container, built on Envoy.
 
 ## Features
 
-* TLS termination
-* GRPC
-* Web Sockets
-* HTTP->HTTPS redirection
-* Domain name redirection
-* Built-in authorization (`Basic` and `Bearer` HTTP authentication)
-* Sharding (different subdomains for different environments)
-* Automatic certificate generation via CertBot/LetsEncrypt
+* GRPC (HTTP2.0) and WebSockets work side-by-side on the same paths with HTTP1.1
+* TLS termination with automatic certificate generation via CertBot/LetsEncrypt
+* Redirection (HTTP->HTTPS, domain1->domain2, etc.)
+* Authorization (`Basic` and `Bearer` HTTP authentication)
+* Observability integration (statsd)
 * Stateless (certificate backup via S3)
+* Sharding (different subdomains for different environments)
 
 ## Motivation
 
 I have a Kubernetes deployment running in production which needs to route traffic from multiple different domains to different containers. I also run a development version of the same stack on my Linux computer at my house, and I want to use `kustomization` to tweak the same deployment files such that `dev` subdomains route to this home machine.
+
+Switchboard also solves for the fact that Envoy would normally require additional containers (sidecars?) implement authentication, observability, certificate generation, etc.
 
 # Configuration
 ----
@@ -102,15 +102,19 @@ Assuming that the value `dev` is provided, then the following will be true of in
 * `https?://:mydomain.com:my-cluster` will instead listen on `http://dev.mydomain.com`
 * `wss!://test!:mydomain.com:my-cluster` will _still listen on_ `https://test.mydomain.com` (no change)
 
-## Certificate Generation
+## Observability
 
-If the `https` or `wss` schema is used for any ingress, and the `email` variable is provided, Switchboard will attempt to use LetsEncrypt to generate a certificate.
+If the `stats_type` configuration is set to `statsd`, the `statsd_exporter` will automatically be started. It will receive traffic from Envoy on port `9125` and publish metrics on port `9102`, meaning that these ports become reserved and clients like Prometheus can connect to `{IP}:9125/metrics`.
 
 ## Authorization
 
 If the `auth_port` configuration is provided, Switchboard will automatically create a self-managed authorization server to protect access to given domains. It will look for yaml files in `/etc/switchboard/authorizations/` which match the domain name being accessed.
 
 Note: using the `authorization` feature automatically creates a GRPC cluster named `ext-authz`, powered by an internal Go server, and checks with this server before processing any request.
+
+## Certificate Generation
+
+If the `https` or `wss` schema is used for any ingress, and the `email` variable is provided, Switchboard will attempt to use LetsEncrypt to generate a certificate.
 
 ### Examples
 

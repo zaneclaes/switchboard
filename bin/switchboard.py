@@ -192,7 +192,7 @@ def _virtual_host(fqdns, routes):
 def _filter_http_connection_manager(router_name, virtual_hosts = [], base_config = {}):
   def_cfg = {
     'codec_type': 'AUTO',
-    'stat_prefix': 'ingress_http',
+    'stat_prefix': 'ingress_' + router_name,
     'add_user_agent': True,
     'use_remote_address': True,
     'access_log': [],
@@ -324,6 +324,7 @@ if __name__ == "__main__":
     'default_route': '',
     'shard': '',
     'email': '',
+    'stats_type': '',
   }
   cfg = dict(defcfg)
   if os.path.isfile('/etc/switchboard/config.yml'):
@@ -478,8 +479,19 @@ if __name__ == "__main__":
   if len(listeners) <= 0: raise Exception("No listeners created.")
 
   resources = { 'listeners': listeners, 'clusters': list(dest_clusters.values()) }
-  data = { "static_resources": resources }
+  data = { "static_resources": resources, 'stats_sinks': [] }
   if cfg['admin_port'] > 0: data['admin'] = _admin()
+  if len(cfg['stats_type']) > 0:
+    if cfg['stats_type'] == 'statsd':
+      sh('/bin/statsd_exporter &')
+      data['stats_sinks'].append({
+        'name': 'envoy.statsd',
+        'config': {
+          'address': _socket_address("127.0.0.1", 9125)
+        }
+      })
+    else:
+      raise Exception("Unknown stats_type: " + cfg['stats_type'])
   sh('mkdir -p /etc/envoy')
   with open('/etc/envoy/envoy.yaml', 'w') as outfile:
     yaml.dump(data, outfile, default_flow_style=False)
