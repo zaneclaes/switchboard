@@ -1,14 +1,19 @@
 #!/usr/bin/python3.7
-import yaml, json, configparser, os, subprocess, re, logging
+import yaml, json, configparser, os, subprocess, re, logging, time
 from collections import defaultdict
 
 domain_tls = {}
+new_certs = []
+certbot_renewal = None
 
 # --------------------------------------------------------------------------------------------------
 # Regex Definitions
 # --------------------------------------------------------------------------------------------------
 def _re_param(name, pattern):
   return f"(?P<{name}>{pattern})"
+
+le_dir = '/etc/letsencrypt'
+le_fnz = '/etc/letsencrypt.zip'
 
 re_certbot_filename = _re_param("name", "\w+")
 re_certbot_version = _re_param("version", "\d+")
@@ -27,7 +32,7 @@ re_in_subdomain = "".join([
 ])
 re_in_domain = _re_param("domain", "[\.a-z0-9-]+")
 re_in_path = "".join([
-  _re_param("path", "[\.\/a-z0-9-]*"),
+  _re_param("path", "[\.\/A-Za-z0-9-]*"),
   _re_param("strip_path", "\!?") # If ends with !, strip the path prefix
 ])
 re_in_dest = _re_param("dest", "[\.a-z0-9-]+")
@@ -45,7 +50,7 @@ re_eg_matcher = re.compile(re_egress)
 # --------------------------------------------------------------------------------------------------
 
 def _file_access_log(router_name):
-  ret = { "name": "envoy.file_access_log", "config": {} }
+  ret = { "name": "envoy.access_loggers.file", "config": {} }
   if len(cfg['log_path']) > 0: ret['config']['path'] = '%s/%s.log' % (cfg['log_path'], router_name)
   else: ret['config']['path'] = '/dev/stdout'
 
@@ -57,11 +62,8 @@ def _file_access_log(router_name):
 
   return ret
 
-def sh(cmd, print_cmd = True):
-  proc = subprocess.Popen(cmd, shell=True)
-  comm = proc.communicate()
-  if proc.returncode != 0:  raise Exception('[Shell] [ERROR]', comm)
-  return comm[0]
+def sh(cmd):
+  return subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True).stdout.strip()
 
 # Route traffic (within a virtual host) to a specific cluster.
 def _match_route(base, dest_schema, prefix = '/', match_options = {}):
@@ -82,7 +84,11 @@ def _match_routes_egress(listener_schema, dest_name, path_prefix = '/', route_op
   if not dest_name in dest_schemas:
     raise Exception(f"{dest_name} was not registered as an egress point")
   routes = []
-  for dest_schema in dest_schemas[dest_name]:
+  schemas = list(dest_schemas[dest_name])
+  if 'http' in schemas:
+    # HTTP has no match predicates (default) and should be at the end.
+    schemas.append(schemas.pop(schemas.index('http')))
+  for dest_schema in schemas:
     cluster_name = f"{dest_schema}-{dest_name}"
     if not cluster_name in dest_clusters:
       raise Exception(f"{cluster_name} was not a redirection or cluster")
@@ -93,52 +99,57 @@ def _match_routes_egress(listener_schema, dest_name, path_prefix = '/', route_op
   return routes
 
 def _certificate(domain):
+  global certbot_renewal, new_certs, domain_tls
+
   if domain in domain_tls: # Use cached version.
     logging.info(f'certificate already generated for {domain}')
     return domain_tls[domain]
 
-  le_dir = '/etc/letsencrypt'
-  fnz = '/etc/letsencrypt.zip'
   s3z = f"s3://{cfg['s3_bucket']}/letsencrypt.zip" if len(cfg['s3_bucket']) > 0 else None
   if not os.path.isdir(le_dir):
-    logging.warn(f"skipping _certificate for {domain}")
+    logging.warning(f"skipping _certificate for {domain}")
     return {}
   if s3z and not os.path.isdir(f'{le_dir}/renewal'):
     logging.info(f'restoring certificates from {s3z}')
-    sh(f'aws s3 cp "{s3z}" "{fnz}"')
-    sh(f'unzip -q -o "{fnz}" -d "{le_dir}"')
-    for dname in os.listdir(f'{le_dir}/live'): # Enumerate the sites in the live directory
-      live_dir = os.path.join(f'{le_dir}/live', dname)
-      archive_dir = f'{le_dir}/archive/{dname}'
-      if not os.path.isdir(live_dir): continue
-      logging.info(f'linking certificates for {dname}')
-      file_versions = defaultdict(int)
-      # Enumerate all files in the archive and get the latest version for each
-      for fname in os.listdir(archive_dir):
-        match = re_certbot_pem_matcher.match(fname)
-        if not match: continue
-        v = int(match.group('version'))
-        if v < file_versions[match.group('name')]: continue
-        file_versions[match.group('name')] = v
-      # Symlink the latest versions of the files
-      for fname in file_versions:
-        v = file_versions[fname]
-        src = f'{archive_dir}/{fname}{v}.pem'
-        dst = f'{live_dir}/{fname}.pem'
-        logging.debug(f'symlinking {src} to {dst}')
-        sh(f'rm -rf {dst} && ln -s "{src}" "{dst}"')
+    try:
+      sh(f'aws s3 cp "{s3z}" "{le_fnz}"')
+      sh(f'unzip -q -o "{le_fnz}" -d "{le_dir}"')
+    except Exception as e:
+      logging.error(f'{e}')
+    if os.path.isdir(f'{le_dir}/live'):
+      for dname in os.listdir(f'{le_dir}/live'): # Enumerate the sites in the live directory
+        live_dir = os.path.join(f'{le_dir}/live', dname)
+        archive_dir = f'{le_dir}/archive/{dname}'
+        if not os.path.isdir(live_dir): continue
+        logging.info(f'linking certificates for {dname}')
+        file_versions = defaultdict(int)
+        # Enumerate all files in the archive and get the latest version for each
+        for fname in os.listdir(archive_dir):
+          match = re_certbot_pem_matcher.match(fname)
+          if not match: continue
+          v = int(match.group('version'))
+          if v < file_versions[match.group('name')]: continue
+          file_versions[match.group('name')] = v
+        # Symlink the latest versions of the files
+        for fname in file_versions:
+          v = file_versions[fname]
+          src = f'{archive_dir}/{fname}{v}.pem'
+          dst = f'{live_dir}/{fname}.pem'
+          logging.debug(f'symlinking {src} to {dst}')
+          sh(f'rm -rf {dst} && ln -s "{src}" "{dst}"')
 
   email = cfg['email']
   if len(email) <= 0:
-    logging.warn(f"cannot generate a certificate for {domain} because no email provided")
+    logging.warning(f"cannot generate a certificate for {domain} because no email provided")
     return {}
 
   fn_renew = f"{le_dir}/renewal/{domain}.conf"
-  cb_flags = '--dns-route53 -q'
+  cb_flags = '--no-random-sleep-on-renew --dns-route53 -q' # --post-hook "sudo service nginx reload"
   if os.path.isfile(fn_renew):
-    logging.info(f'renewing certificate for {domain}...')
-    sh(f'certbot renew {cb_flags}')#  --post-hook "sudo service nginx reload"
+    logging.info(f'queuing renewal certificate for {domain}...')
+    certbot_renewal = f'(certbot renew {cb_flags} || true)'
   else:
+    new_certs.append(domain)
     logging.info(f'requesting certificate for {domain}')
     sh(
       f'certbot certonly {cb_flags} -d \"*.{domain}\" -d {domain} -m {email} ' +
@@ -146,23 +157,30 @@ def _certificate(domain):
     )
 
   if not os.path.isdir('/etc/letsencrypt/live/' + domain):
-    raise Exception("Failed to get a certificate for " + domain)
-  if s3z:
+    logging.error("Failed to get a certificate for " + domain)
+    # raise Exception("Failed to get a certificate for " + domain)
+  # if s3z:
     # Back up with every cert creation, so that intermediate progress is saved
     # In the case there are lots of certs, this can be a useful trait if containers
     # are killed by some health check daemon.
-    with open('/var/log/letsencrypt/letsencrypt.log', 'r') as lf:
-      log = lf.read()
-      if "-BEGIN CERTIFICATE-" in log:
-        logging.info(f"backing up letsencrypt to {s3z}")
-        sh(f'cd {le_dir} && zip -r -q --exclude="*.DS_Store*" "{fnz}" .')
-        sh(f'aws s3 cp "{fnz}" "{s3z}" --sse AES256')
-  os.rename('/var/log/letsencrypt/letsencrypt.log', '/var/log/letsencrypt/%s.log' % domain)
+    # with open('/var/log/letsencrypt/letsencrypt.log', 'r') as lf:
+      # log = lf.read()
+      # if "-BEGIN CERTIFICATE-" in log:
+  if os.path.isfile('/var/log/letsencrypt/letsencrypt.log'):
+      os.rename('/var/log/letsencrypt/letsencrypt.log', '/var/log/letsencrypt/%s.log' % domain)
   domain_tls[domain] = {
     "certificate_chain": { "filename": "/etc/letsencrypt/live/%s/fullchain.pem" % domain },
     "private_key": { "filename": "/etc/letsencrypt/live/%s/privkey.pem" % domain }
   }
   return domain_tls[domain]
+
+# Back up the certificates to s3
+def _backup_certs():
+  s3z = f"s3://{cfg['s3_bucket']}/letsencrypt.zip" if len(cfg['s3_bucket']) > 0 else None
+
+  logging.info(f"backing up letsencrypt to {s3z}")
+  sh(f'cd {le_dir} && zip -r -q --exclude="*.DS_Store*" "{le_fnz}" .')
+  sh(f'aws s3 cp "{le_fnz}" "{s3z}" --sse AES256')
 
 def _shard(shard, subdomain, domain):
   # calculate `sharded`, the _real_ subdomain value
@@ -192,6 +210,7 @@ def _virtual_host(fqdns, routes):
 def _filter_http_connection_manager(router_name, virtual_hosts = [], base_config = {}):
   def_cfg = {
     'codec_type': 'AUTO',
+    'server_name': router_name,
     'stat_prefix': 'ingress_' + router_name,
     'add_user_agent': True,
     'use_remote_address': True,
@@ -218,19 +237,6 @@ def _filter_http_connection_manager(router_name, virtual_hosts = [], base_config
 
 def _vh_filters(router_name, virtual_hosts = [], config = {}):
   return [{ 'filters': _filter_http_connection_manager(router_name, virtual_hosts, config) }]
-
-def _secure_filter_chain(domain, fqdns):
-  router_name = '-'.join(['https'] + fqdns)
-  return {
-    'filter_chain_match': { "server_names": fqdns },
-    'filters': [_filter_http_connection_manager(router_name)],
-    'tls_context': {
-      'common_tls_context': {
-        'alpn_protocols': 'h2',
-        'tls_certificates': [_certificate(domain)]
-      }
-    }
-  }
 
 def _socket_address(address, port):
   return { 'socket_address': { 'address': address, 'port_value': port } }
@@ -305,6 +311,24 @@ def get_uniq_config_values(name):
       with open(os.path.join(d, fn), 'r') as f:
         ret = ret.union(set(str2list(f.read())))
   return [os.path.expandvars(x) for x in ret]
+
+_alive = True
+def _certbot_thread():
+  global certbot_renewal, new_certs, domain_tls, _alive
+
+  if certbot_renewal:
+    logging.info(f'Renewing certificates...')
+    sh(certbot_renewal)
+
+  if len(new_certs) > 0:
+    logging.info(f'New certificates were generated: {new_certs}')
+    _backup_certs()
+
+  while _alive:
+    logging.info(f'Checking renewals...')
+    time.sleep(10)
+
+  sys.exit(0)
 
 if __name__ == "__main__":
   defcfg = {
@@ -431,10 +455,35 @@ if __name__ == "__main__":
 
       log.debug(f'listener {listener_schema} with routes {routes}')
       if listener_schema == 'https':
-        if not fqdns_str in secure_filter_chains:
-          secure_filter_chains[fqdns_str] = _secure_filter_chain(domain, fqdns)
-        secure_filter_chains[fqdns_str]['filters'][0]['config'].update(filter_config)
-        secure_domain_routes[fqdns_str] += routes
+        sfc = secure_filter_chains[domain] if domain in secure_filter_chains else {
+          'filter_chain_match': { "server_names": [] },
+          'filters': [_filter_http_connection_manager('-'.join(['https', domain]))],
+          # 'tls_context': {
+          #   'common_tls_context': {
+          #     'alpn_protocols': 'h2',
+          #     'tls_certificates': [_certificate(domain)]
+          #   }
+          # }
+          'transport_socket': {
+            'name': 'envoy.transport_sockets.tls',
+            'typed_config': {
+              "@type": 'type.googleapis.com/envoy.api.v2.auth.UpstreamTlsContext',
+              'common_tls_context': {
+                'tls_certificates':  _certificate(domain)
+              }
+            }
+          }
+        }
+        sfc['filters'][0]['config'].update(filter_config)
+
+        fqdns = fqdns_str.split(splitter)
+        for fq in fqdns:
+          if not fq in sfc['filter_chain_match']['server_names']:
+            sfc['filter_chain_match']['server_names'].append(fq)
+        vh = _virtual_host(fqdns, routes)
+        sfc['filters'][0]['config']['route_config']['virtual_hosts'].append(vh)
+
+        secure_filter_chains[domain] = sfc
       elif listener_schema == 'http':
         unsecure_domain_routes[fqdns_str] += routes
       elif listener_schema == 'ws':
@@ -456,11 +505,8 @@ if __name__ == "__main__":
   listeners = []
   if len(secure_filter_chains) > 0:
     matches = []
-    for fqdns_str in secure_filter_chains:
-      match = secure_filter_chains[fqdns_str]
-      vh = _virtual_host(fqdns_str.split(splitter), secure_domain_routes[fqdns_str])
-      match['filters'][0]['config']['route_config']['virtual_hosts'].append(vh)
-      matches.append(match)
+    for domain in secure_filter_chains:
+      matches.append(secure_filter_chains[domain])
     # Redirect unmatched HTTPS back to HTTP...
     route_http = _match_redirect({ 'scheme_redirect': 'http' }, 'https')
     matches.append(_vh_filters('https', [_virtual_host(["*"], route_http)]))
@@ -496,9 +542,15 @@ if __name__ == "__main__":
   with open('/etc/envoy/envoy.yaml', 'w') as outfile:
     yaml.dump(data, outfile, default_flow_style=False)
 
+  if len(domain_tls) > 0:
+    if os.fork() == 0: _certbot_thread()
+
   if cfg['log_level'].upper() != 'INFO': envoy_flags += ['-l', cfg['log_level'].lower()]
   if len(cfg['log_format_envoy']) > 0:
     envoy_flags += ['--log-format', "\"" + cfg['log_format_envoy'] + "\""]
+
   cmd = f'envoy ' + ' '.join(envoy_flags)
   logging.debug(f'Starting envoy with command: {cmd}')
   sh(cmd)
+  logging.info(f'Exiting Switchboard...')
+  _alive = False;
