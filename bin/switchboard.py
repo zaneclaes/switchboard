@@ -1,5 +1,5 @@
 #!/usr/bin/python3.7
-import yaml, json, configparser, os, subprocess, re, logging, time
+import yaml, json, configparser, os, subprocess, re, logging, time, shutil
 from collections import defaultdict
 
 domain_tls = {}
@@ -50,20 +50,32 @@ re_eg_matcher = re.compile(re_egress)
 # --------------------------------------------------------------------------------------------------
 
 def _file_access_log(router_name):
-  ret = { "name": "envoy.access_loggers.file", "config": {} }
-  if len(cfg['log_path']) > 0: ret['config']['path'] = '%s/%s.log' % (cfg['log_path'], router_name)
-  else: ret['config']['path'] = '/dev/stdout'
+  ret = {
+    "name": "envoy.file_access_log", # TODO: envoy.access_loggers.file
+    'filter': { 'not_health_check_filter': {} },
+    "typed_config": {
+      '@type': 'type.googleapis.com/envoy.config.accesslog.v2.FileAccessLog'
+    }
+  }
+  if len(cfg['log_path']) > 0:
+    ret['typed_config']['path'] = '%s/%s.log' % (cfg['log_path'], router_name)
+  else: ret['typed_config']['path'] = '/dev/stdout'
 
   if len(cfg['log_format_access']) > 0:
-    ret['config']['format'] = cfg['log_format_access'].replace('%ROUTER%', router_name)
+    ret['typed_config']['format'] = cfg['log_format_access'].replace('%ROUTER%', router_name)
   elif len(cfg['log_format_access_json']) > 0:
-    ret['config']['json_format'] = json.loads(
+    ret['typed_config']['json_format'] = json.loads(
       cfg['log_format_access_json'].replace('%ROUTER%', router_name))
 
   return ret
 
 def sh(cmd):
-  return subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True).stdout.strip()
+  ret = subprocess.run(cmd, shell=True, check=False, capture_output=True, text=True)
+  stdout = ret.stdout.strip()
+  stderr = ret.stderr.strip()
+  if ret.returncode != 0:
+    raise Exception(f'Failed to run {cmd} because:\nstdout: "{stdout}"\nstderr: "{stderr}"')
+  return stdout
 
 # Route traffic (within a virtual host) to a specific cluster.
 def _match_route(base, dest_schema, prefix = '/', match_options = {}):
@@ -144,11 +156,8 @@ def _certificate(domain):
     return {}
 
   fn_renew = f"{le_dir}/renewal/{domain}.conf"
-  cb_flags = '--no-random-sleep-on-renew --dns-route53 -q' # --post-hook "sudo service nginx reload"
-  if os.path.isfile(fn_renew):
-    logging.info(f'queuing renewal certificate for {domain}...')
-    certbot_renewal = f'(certbot renew {cb_flags} || true)'
-  else:
+  cb_flags = '' # --post-hook "sudo service nginx reload"
+  if not os.path.isfile(fn_renew):
     new_certs.append(domain)
     logging.info(f'requesting certificate for {domain}')
     sh(
@@ -209,9 +218,10 @@ def _virtual_host(fqdns, routes):
 
 def _filter_http_connection_manager(router_name, virtual_hosts = [], base_config = {}):
   def_cfg = {
+    "@type": 'type.googleapis.com/envoy.config.filter.network.http_connection_manager.v2.HttpConnectionManager',
     'codec_type': 'AUTO',
     'server_name': router_name,
-    'stat_prefix': 'ingress_' + router_name,
+    'stat_prefix': 'ingress_http',
     'add_user_agent': True,
     'use_remote_address': True,
     'access_log': [],
@@ -231,9 +241,10 @@ def _filter_http_connection_manager(router_name, virtual_hosts = [], base_config
       }
     })
   config['access_log'].append(_file_access_log(router_name))
-  config['http_filters'].append({ 'name': 'envoy.router' })
+  config['http_filters'].append({ 'name': 'envoy.router', 'typed_config': {} }) # envoy.filters.http.router
   config['route_config'] = { 'virtual_hosts': list(virtual_hosts) }
-  return { 'name': 'envoy.http_connection_manager', 'config': config }
+  # 1.14.0 TODO: envoy.filters.network.http_connection_manager
+  return { 'name': 'envoy.http_connection_manager', 'typed_config': config }
 
 def _vh_filters(router_name, virtual_hosts = [], config = {}):
   return [{ 'filters': _filter_http_connection_manager(router_name, virtual_hosts, config) }]
@@ -278,13 +289,18 @@ def _cluster(schema, name, address, port):
 # --------------------------------
 
 def _listener(schema, filter_chains):
-  listener = { 'name': schema, 'address': _ingress_address(schema), 'filter_chains': filter_chains }
+  listener = {
+    'name': schema,
+    'address': _ingress_address(schema),
+    'traffic_direction': 'INBOUND',
+    'filter_chains': filter_chains
+  }
   if "USE_PROXY_PROTOCOL" in os.environ:
     if not 'listener_filters' in listener: listener['listener_filters'] = []
     listener['listener_filters'] += [{'name': 'envoy.listener.proxy_protocol'}]
   if schema == 'https':
     if not 'listener_filters' in listener: listener['listener_filters'] = []
-    listener['listener_filters'] += [{'name': 'envoy.listener.tls_inspector', 'config': {}}]
+    listener['listener_filters'] += [{'name': 'envoy.listener.tls_inspector', 'typed_config': {}}]
   return listener
 
 # --------------------------------------------------------------------------------------------------
@@ -313,20 +329,51 @@ def get_uniq_config_values(name):
   return [os.path.expandvars(x) for x in ret]
 
 _alive = True
-def _certbot_thread():
-  global certbot_renewal, new_certs, domain_tls, _alive
+renewal_interval = 86400 # Attempt certificate renewal daily...
 
-  if certbot_renewal:
-    logging.info(f'Renewing certificates...')
-    sh(certbot_renewal)
+# Trigger a renewal of certbot certificates. Returns True if renewed.
+def _certbot_renew():
+  global last_renewal
+  logging.info(f'Renewing certificates...')
+  cmd = 'certbot renew --no-random-sleep-on-renew --dns-route53 -q'
+  ret = subprocess.run(cmd, shell=True, check=False)
+  if ret.returncode != 0:
+    logging.error(f'Failed to renew certificates; err: {ret.stderr}')
+    return False
+
+  last_renewal = time.time()
+
+  lf = '/var/log/letsencrypt/letsencrypt.log'
+  if not os.path.isfile(lf):
+    logging.warning(f'Renewal succeded, but no log file at {lf}')
+    return False
+
+  with open(lf, 'r') as f: logs = f.read().strip()
+  if 'Your certificate and chain have been saved' in logs:
+    logging.info(f'Certificate change detected.')
+    return True
+
+  logging.info('No certificate change detected.')
+  return False
+
+# Forked thread which runs indefinitely to renew certs.
+def _certbot_thread():
+  global new_certs, last_renewal, domain_tls, _alive
+
+  _certbot_renew()
 
   if len(new_certs) > 0:
     logging.info(f'New certificates were generated: {new_certs}')
     _backup_certs()
 
   while _alive:
-    logging.info(f'Checking renewals...')
-    time.sleep(10)
+    elapsed = time.time() - last_renewal
+    if elapsed < renewal_interval:
+      time.sleep(10)
+      continue
+
+    if _certbot_renew():
+      _backup_certs()
 
   sys.exit(0)
 
@@ -458,30 +505,26 @@ if __name__ == "__main__":
         sfc = secure_filter_chains[domain] if domain in secure_filter_chains else {
           'filter_chain_match': { "server_names": [] },
           'filters': [_filter_http_connection_manager('-'.join(['https', domain]))],
-          # 'tls_context': {
-          #   'common_tls_context': {
-          #     'alpn_protocols': 'h2',
-          #     'tls_certificates': [_certificate(domain)]
-          #   }
-          # }
           'transport_socket': {
             'name': 'envoy.transport_sockets.tls',
             'typed_config': {
-              "@type": 'type.googleapis.com/envoy.api.v2.auth.UpstreamTlsContext',
+              "@type": 'type.googleapis.com/envoy.api.v2.auth.DownstreamTlsContext',
               'common_tls_context': {
                 'tls_certificates':  _certificate(domain)
               }
             }
           }
         }
-        sfc['filters'][0]['config'].update(filter_config)
-
+        # Add all the domains to the server names.
         fqdns = fqdns_str.split(splitter)
         for fq in fqdns:
           if not fq in sfc['filter_chain_match']['server_names']:
             sfc['filter_chain_match']['server_names'].append(fq)
+
+        # Update the filter with a virtual host and any necessary config tweaks.
         vh = _virtual_host(fqdns, routes)
-        sfc['filters'][0]['config']['route_config']['virtual_hosts'].append(vh)
+        sfc['filters'][0]['typed_config']['route_config']['virtual_hosts'].append(vh)
+        sfc['filters'][0]['typed_config'].update(filter_config)
 
         secure_filter_chains[domain] = sfc
       elif listener_schema == 'http':
@@ -543,6 +586,20 @@ if __name__ == "__main__":
     yaml.dump(data, outfile, default_flow_style=False)
 
   if len(domain_tls) > 0:
+    # Cleanup unused certificates:
+    if os.path.isdir(f'{le_dir}/live'):
+      for dname in os.listdir(f'{le_dir}/live'): # Enumerate the sites in the live directory
+        if dname in domain_tls: continue
+
+        live_dir = os.path.join(f'{le_dir}/live', dname)
+        if not os.path.isdir(live_dir): continue
+
+        logging.info(f'removing unused certificates for {dname}...')
+        shutil.rmtree(live_dir)
+
+        cf = f'{le_dir}/renewal/{dname}.conf'
+        if os.path.isfile(cf): os.remove(cf)
+
     if os.fork() == 0: _certbot_thread()
 
   if cfg['log_level'].upper() != 'INFO': envoy_flags += ['-l', cfg['log_level'].lower()]
@@ -551,6 +608,7 @@ if __name__ == "__main__":
 
   cmd = f'envoy ' + ' '.join(envoy_flags)
   logging.debug(f'Starting envoy with command: {cmd}')
-  sh(cmd)
-  logging.info(f'Exiting Switchboard...')
+  res = subprocess.run(cmd, shell=True, check=False, capture_output=False)
+  logging.info(f'Exiting with return code: {res.returncode}')
   _alive = False;
+  exit(res.returncode)
