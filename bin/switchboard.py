@@ -222,8 +222,11 @@ def _filter_http_connection_manager(router_name, virtual_hosts = [], base_config
     'codec_type': 'AUTO',
     'server_name': router_name,
     'stat_prefix': 'ingress_http',
-    'add_user_agent': True,
-    'use_remote_address': True,
+    'add_user_agent': cfg['add_user_agent'],
+    'use_remote_address': cfg['use_remote_address'],
+    'skip_xff_append': cfg['skip_xff_append'],
+    'xff_num_trusted_hops': cfg['xff_num_trusted_hops'],
+    'preserve_external_request_id': cfg['preserve_external_request_id'],
     'access_log': [],
     'http_filters': []
   }
@@ -243,6 +246,8 @@ def _filter_http_connection_manager(router_name, virtual_hosts = [], base_config
   config['access_log'].append(_file_access_log(router_name))
   config['http_filters'].append({ 'name': 'envoy.router', 'typed_config': {} }) # envoy.filters.http.router
   config['route_config'] = { 'virtual_hosts': list(virtual_hosts) }
+  if len(cfg['dd_agent_host']) > 0:
+    config['tracing'] = { 'operation_name': 'egress' }
   # 1.14.0 TODO: envoy.filters.network.http_connection_manager
   return { 'name': 'envoy.http_connection_manager', 'typed_config': config }
 
@@ -316,6 +321,12 @@ def val2int(val):
   if len(val) <= 0: return 0
   return int(val)
 
+def val2bool(val):
+  if type(val) is bool: return val
+  if not type(val) is str: raise Exception(f'{val} is not an bool or string')
+  if len(val) <= 0: return 0
+  return val.lower() in ("yes", "true", "t", "1")
+
 # Combine an environment variable with the contents of any files into a single set of values
 # i.e., passing 'ingress' will look at the INGRESS env. var and /etc/switchboard/ingress/**
 def get_uniq_config_values(name):
@@ -386,11 +397,17 @@ if __name__ == "__main__":
     'log_format_auth': '',
     'log_level': 'INFO',
     'log_path': '',
+    'dd_agent_host': '',
     's3_bucket': '',
     'bind_address': '0.0.0.0',
     'admin_port': 5000,
     'http_port': 8080,
     'https_port': 8443,
+    'use_remote_address': True,
+    'add_user_agent': True,
+    'skip_xff_append': False,
+    'xff_num_trusted_hops': 0,
+    'preserve_external_request_id': True,
     'auth_port': 0,
     'default_route': '',
     'shard': '',
@@ -404,6 +421,7 @@ if __name__ == "__main__":
   for var_name in cfg:
     cfg[var_name] = os.getenv(var_name.upper(), cfg[var_name])
     if type(defcfg[var_name]) is int: cfg[var_name] = val2int(cfg[var_name])
+    if type(defcfg[var_name]) is bool: cfg[var_name] = val2bool(cfg[var_name])
 
   envoy_flags = ['-c', '/etc/envoy/envoy.yaml']
   if len(cfg['log_path']) > 0:
@@ -425,6 +443,7 @@ if __name__ == "__main__":
   # [Egress] Build Routes
   dest_clusters = {}
   dest_schemas = defaultdict(set)
+  tracing = {}
 
   # [Authorization] Start Go server?
   if cfg['auth_port'] > 0:
@@ -432,6 +451,27 @@ if __name__ == "__main__":
     destinations.append('ext-authz:grpc@localhost:%s' % cfg['auth_port'])
     sh('/usr/local/bin/ext-authz %s %s %s &' % (
       cfg['auth_port'], cfg['log_level'], cfg['log_format_auth']))
+
+  if len(cfg['dd_agent_host']) > 0:
+    dest_clusters['datadog_agent'] = {
+      'name': 'datadog_agent',
+      'connect_timeout': '1s',
+      'type': 'strict_dns',
+      'lb_policy': 'ROUND_ROBIN',
+      'hosts': [{
+        'socket_address': {
+          'address': cfg['dd_agent_host'],
+          'port_value': 8126
+        }
+      }]
+    }
+    tracing['http'] = {
+      'name': 'envoy.tracers.datadog',
+      'config': {
+        'collector_cluster': 'datadog_agent',
+        'service_name': 'envoy'
+      }
+    }
 
   for dest_str in destinations:
     log = logging.getLogger(f"<egress>{dest_str}")
@@ -568,7 +608,7 @@ if __name__ == "__main__":
   if len(listeners) <= 0: raise Exception("No listeners created.")
 
   resources = { 'listeners': listeners, 'clusters': list(dest_clusters.values()) }
-  data = { "static_resources": resources, 'stats_sinks': [] }
+  data = { "static_resources": resources, 'stats_sinks': [], 'tracing': tracing }
   if cfg['admin_port'] > 0: data['admin'] = _admin()
   if len(cfg['stats_type']) > 0:
     if cfg['stats_type'] == 'statsd':
@@ -581,6 +621,7 @@ if __name__ == "__main__":
       })
     else:
       raise Exception("Unknown stats_type: " + cfg['stats_type'])
+
   sh('mkdir -p /etc/envoy')
   with open('/etc/envoy/envoy.yaml', 'w') as outfile:
     yaml.dump(data, outfile, default_flow_style=False)
@@ -606,7 +647,7 @@ if __name__ == "__main__":
   if len(cfg['log_format_envoy']) > 0:
     envoy_flags += ['--log-format', "\"" + cfg['log_format_envoy'] + "\""]
 
-  cmd = f'envoy ' + ' '.join(envoy_flags)
+  cmd = f'/usr/local/bin/envoy ' + ' '.join(envoy_flags)
   logging.debug(f'Starting envoy with command: {cmd}')
   res = subprocess.run(cmd, shell=True, check=False, capture_output=False)
   logging.info(f'Exiting with return code: {res.returncode}')

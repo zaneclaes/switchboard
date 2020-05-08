@@ -9,16 +9,31 @@ RUN CGO_ENABLED=0 GOOOS=linux go build -o ext-authz
 
 FROM prom/statsd-exporter:latest AS statsd
 
-FROM envoyproxy/envoy:v1.12.3 AS envoy
+# FROM envoyproxy/envoy:latest AS envoy
+FROM debian:buster-slim
+
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && apt-get install -y ca-certificates \
+    && apt-get autoremove -y \
+    && apt-get clean \
+    && rm -rf /tmp/* /var/tmp/* \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /etc/envoy
+
+ADD envoy-armeabihf /usr/local/bin/envoy
+
+EXPOSE 10000
 
 RUN apt-get update && apt-get install -y software-properties-common
-RUN apt-get install -y zip unzip curl
-RUN add-apt-repository -y ppa:deadsnakes/ppa && apt-get update && apt-get install -y python3.7
+RUN apt-get install -y zip unzip curl python3-pip
+# RUN add-apt-repository -y ppa:deadsnakes/ppa && apt-get update && apt-get install -y python3.7
 # RUN add-apt-repository -y ppa:certbot/certbot && apt-get update && apt-get install -y python-certbot-apache
 
-RUN curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py && \
-  python3.7 get-pip.py && \
-  rm -rf get-pip.py
+# RUN curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py && \
+#   python3.7 get-pip.py && \
+#   rm -rf get-pip.py
 RUN pip3 install certbot_dns_route53 awscli configparser cffi
 
 ADD bin /usr/local/bin

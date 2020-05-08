@@ -39,6 +39,8 @@ Default values (in parenthesis).
 * `admin_port`: The port for the Envoy admin interface (`5000`); an empty value will disable the admin interface.
 * `auth_port`: Enable `ext-authz` on the specified port (see: Authorizations)
 * `bind_address`: The address on which to listen (`0.0.0.0`)
+* `use_remote_address`: See [Envoy's documentation](https://www.envoyproxy.io/docs/envoy/latest/api-v2/config/filter/network/http_connection_manager/v2/http_connection_manager.proto) (default=true)
+* `add_user_agent`: See [Envoy's documentation](https://www.envoyproxy.io/docs/envoy/latest/api-v2/config/filter/network/http_connection_manager/v2/http_connection_manager.proto) (default=true)
 * `log_format_switchboard`: The Python `logger` format for Switchboard (`[%(asctime)s] [%(process)d] [%(levelname)s] [%(name)s] %(message)s`)
 * `log_format_envoy`: The Envoy application log format (empty = Envoy default)
 * `log_format_access`: The access log format for Envoy (empty = Envoy default)
