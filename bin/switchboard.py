@@ -550,7 +550,8 @@ if __name__ == "__main__":
             'typed_config': {
               "@type": 'type.googleapis.com/envoy.api.v2.auth.DownstreamTlsContext',
               'common_tls_context': {
-                'tls_certificates':  _certificate(domain)
+                'tls_certificates':  _certificate(domain),
+                'alpn_protocols': [ "h2,http/1.1" ],
               }
             }
           }
