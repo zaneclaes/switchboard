@@ -399,6 +399,7 @@ if __name__ == "__main__":
     'log_path': '',
     'dd_agent_host': '',
     's3_bucket': '',
+    'concurrency': 0,
     'bind_address': '0.0.0.0',
     'admin_port': 5000,
     'http_port': 8080,
@@ -644,6 +645,8 @@ if __name__ == "__main__":
 
     if os.fork() == 0: _certbot_thread()
 
+  if cfg['concurrency'] > 0:
+    envoy_flags += ['--concurrency', str(cfg['concurrency'])]
   if cfg['log_level'].upper() != 'INFO': envoy_flags += ['-l', cfg['log_level'].lower()]
   if len(cfg['log_format_envoy']) > 0:
     envoy_flags += ['--log-format', "\"" + cfg['log_format_envoy'] + "\""]
