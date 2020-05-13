@@ -621,6 +621,13 @@ if __name__ == "__main__":
           'address': _socket_address("127.0.0.1", 9125)
         }
       })
+    elif cfg['stats_type'] == 'dog_statsd':
+      data['stats_sinks'].append({
+        'name': 'envoy.dog_statsd',
+        'config': {
+          'address': _socket_address(cfg['dd_agent_host'], 8125)
+        }
+      })
     else:
       raise Exception("Unknown stats_type: " + cfg['stats_type'])
 
