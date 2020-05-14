@@ -261,7 +261,8 @@ def _ingress_address(ingress_type):
   return _socket_address(cfg['bind_address'], val2int(cfg[f"{ingress_type}_port"]))
 
 def _admin():
-  if len(cfg['log_path']) > 0: log_path = '%s/envoy_admin.log' % cfg['log_path']
+  if len(cfg['admin_access_log']) > 0: log_path = cfg['admin_access_log']
+  elif len(cfg['log_path']) > 0: log_path = '%s/envoy_admin.log' % cfg['log_path']
   else: log_path = '/dev/stdout'
   return { 'access_log_path': log_path, 'address': _ingress_address('admin') }
 
@@ -297,7 +298,7 @@ def _listener(schema, filter_chains):
   listener = {
     'name': schema,
     'address': _ingress_address(schema),
-    'traffic_direction': 'INBOUND',
+    'traffic_direction': 'OUTBOUND',
     'filter_chains': filter_chains
   }
   if "USE_PROXY_PROTOCOL" in os.environ:
@@ -397,6 +398,7 @@ if __name__ == "__main__":
     'log_format_auth': '',
     'log_level': 'INFO',
     'log_path': '',
+    'admin_access_log': '',
     'dd_agent_host': '',
     's3_bucket': '',
     'concurrency': 0,
