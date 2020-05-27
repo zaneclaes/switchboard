@@ -361,12 +361,10 @@ def _certbot_renew():
     return False
 
   with open(lf, 'r') as f: logs = f.read().strip()
-  if 'Your certificate and chain have been saved' in logs:
-    logging.info(f'Certificate change detected.')
-    return True
+  if not 'no renewal failures' in logs:
+    logging.warning(f'Certificate renewal may have failed.')
 
-  logging.info('No certificate change detected.')
-  return False
+  return True
 
 # Forked thread which runs indefinitely to renew certs.
 def _certbot_thread():
