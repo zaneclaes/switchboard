@@ -156,30 +156,25 @@ def _certificate(domain):
     return {}
 
   fn_renew = f"{le_dir}/renewal/{domain}.conf"
-  cb_flags = '' # --post-hook "sudo service nginx reload"
+  cb_flags = '--dns-route53' # --post-hook "sudo service nginx reload"
   if not os.path.isfile(fn_renew):
     new_certs.append(domain)
     logging.info(f'requesting certificate for {domain}')
+    sh(f'rm -rf {le_dir}/archive/{domain} || true')
+    sh(f'rm -rf {le_dir}/live/{domain} || true')
     sh(
       f'certbot certonly {cb_flags} -d \"*.{domain}\" -d {domain} -m {email} ' +
       '--server https://acme-v02.api.letsencrypt.org/directory --agree-tos --non-interactive'
     )
 
-  if not os.path.isdir('/etc/letsencrypt/live/' + domain):
+  if not os.path.isdir(f'{le_dir}/live/' + domain):
     logging.error("Failed to get a certificate for " + domain)
     # raise Exception("Failed to get a certificate for " + domain)
-  # if s3z:
-    # Back up with every cert creation, so that intermediate progress is saved
-    # In the case there are lots of certs, this can be a useful trait if containers
-    # are killed by some health check daemon.
-    # with open('/var/log/letsencrypt/letsencrypt.log', 'r') as lf:
-      # log = lf.read()
-      # if "-BEGIN CERTIFICATE-" in log:
   if os.path.isfile('/var/log/letsencrypt/letsencrypt.log'):
-      os.rename('/var/log/letsencrypt/letsencrypt.log', '/var/log/letsencrypt/%s.log' % domain)
+      os.rename('/var/log/letsencrypt/letsencrypt.log', f'{le_dir}/{domain}.log')
   domain_tls[domain] = {
-    "certificate_chain": { "filename": "/etc/letsencrypt/live/%s/fullchain.pem" % domain },
-    "private_key": { "filename": "/etc/letsencrypt/live/%s/privkey.pem" % domain }
+    "certificate_chain": { "filename": f"{le_dir}/live/{domain}/fullchain.pem" },
+    "private_key": { "filename": f"{le_dir}/live/{domain}/privkey.pem" }
   }
   return domain_tls[domain]
 
