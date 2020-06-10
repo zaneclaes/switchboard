@@ -107,6 +107,7 @@ def _match_routes_egress(listener_schema, dest_name, path_prefix = '/', route_op
     log.info(f"match egress route {listener_schema} to cluster {dest_schema}://{cluster_name}")
     route = dict(route_options)
     route['cluster'] = cluster_name
+    route['timeout'] = f"{cfg['timeout']}s"
     routes.append(_match_route({ 'route': route }, dest_schema, path_prefix))
   return routes
 
@@ -395,6 +396,7 @@ if __name__ == "__main__":
     'dd_agent_host': '',
     's3_bucket': '',
     'concurrency': 0,
+    'timeout': 15.0,
     'bind_address': '0.0.0.0',
     'admin_port': 5000,
     'http_port': 8080,
