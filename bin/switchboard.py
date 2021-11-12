@@ -115,26 +115,26 @@ def _certificate(domain):
   global certbot_renewal, new_certs, domain_tls
 
   if domain in domain_tls: # Use cached version.
-    logging.info(f'certificate already generated for {domain}')
+    logging.info(f'[certbot] certificate already generated for {domain}')
     return domain_tls[domain]
 
-  s3z = f"s3://{cfg['s3_bucket']}/letsencrypt.zip" if len(cfg['s3_bucket']) > 0 else None
+  s3z = f"s3://{cfg['s3_bucket']}/{cfg['backup']}.zip" if len(cfg['s3_bucket']) > 0 else None
   if not os.path.isdir(le_dir):
-    logging.warning(f"skipping _certificate for {domain}")
+    logging.warning(f"[certbot] skipping _certificate for {domain}")
     return {}
   if s3z and not os.path.isdir(f'{le_dir}/renewal'):
-    logging.info(f'restoring certificates from {s3z}')
+    logging.info(f'[certbot] restoring certificates from {s3z}')
     try:
       sh(f'aws s3 cp "{s3z}" "{le_fnz}"')
       sh(f'unzip -q -o "{le_fnz}" -d "{le_dir}"')
     except Exception as e:
-      logging.error(f'{e}')
+      logging.error(f'[certbot] {e}')
     if os.path.isdir(f'{le_dir}/live'):
       for dname in os.listdir(f'{le_dir}/live'): # Enumerate the sites in the live directory
         live_dir = os.path.join(f'{le_dir}/live', dname)
         archive_dir = f'{le_dir}/archive/{dname}'
         if not os.path.isdir(live_dir): continue
-        logging.info(f'linking certificates for {dname}')
+        logging.info(f'[certbot] linking certificates for {dname}')
         file_versions = defaultdict(int)
         # Enumerate all files in the archive and get the latest version for each
         for fname in os.listdir(archive_dir):
@@ -148,19 +148,19 @@ def _certificate(domain):
           v = file_versions[fname]
           src = f'{archive_dir}/{fname}{v}.pem'
           dst = f'{live_dir}/{fname}.pem'
-          logging.debug(f'symlinking {src} to {dst}')
+          logging.debug(f'[certbot] symlinking {src} to {dst}')
           sh(f'rm -rf {dst} && ln -s "{src}" "{dst}"')
 
   email = cfg['email']
   if len(email) <= 0:
-    logging.warning(f"cannot generate a certificate for {domain} because no email provided")
+    logging.warning(f"[certbot] cannot generate a certificate for {domain}: no email provided")
     return {}
 
   fn_renew = f"{le_dir}/renewal/{domain}.conf"
   cb_flags = '--dns-route53' # --post-hook "sudo service nginx reload"
   if not os.path.isfile(fn_renew):
     new_certs.append(domain)
-    logging.info(f'requesting certificate for {domain}')
+    logging.info(f'[certbot] requesting certificate for {domain}')
     sh(f'rm -rf {le_dir}/archive/{domain} || true')
     sh(f'rm -rf {le_dir}/live/{domain} || true')
     sh(
@@ -169,7 +169,7 @@ def _certificate(domain):
     )
 
   if not os.path.isdir(f'{le_dir}/live/' + domain):
-    logging.error("Failed to get a certificate for " + domain)
+    logging.error("[certbot] failed to get a certificate for " + domain)
     # raise Exception("Failed to get a certificate for " + domain)
   if os.path.isfile('/var/log/letsencrypt/letsencrypt.log'):
       os.rename('/var/log/letsencrypt/letsencrypt.log', f'{le_dir}/{domain}.log')
@@ -181,9 +181,9 @@ def _certificate(domain):
 
 # Back up the certificates to s3
 def _backup_certs():
-  s3z = f"s3://{cfg['s3_bucket']}/letsencrypt.zip" if len(cfg['s3_bucket']) > 0 else None
+  s3z = f"s3://{cfg['s3_bucket']}/{cfg['backup']}.zip" if len(cfg['s3_bucket']) > 0 else None
 
-  logging.info(f"backing up letsencrypt to {s3z}")
+  logging.info(f"[certbot] backing up letsencrypt to {s3z}")
   sh(f'cd {le_dir} && zip -r -q --exclude="*.DS_Store*" "{le_fnz}" .')
   sh(f'aws s3 cp "{le_fnz}" "{s3z}" --sse AES256')
 
@@ -342,24 +342,27 @@ renewal_interval = 86400 # Attempt certificate renewal daily...
 # Trigger a renewal of certbot certificates. Returns True if renewed.
 def _certbot_renew():
   global last_renewal
-  logging.info(f'Renewing certificates...')
+  logging.info(f'[certbot] renewing certificates...')
   cmd = 'certbot renew --no-random-sleep-on-renew --dns-route53 -q'
   ret = subprocess.run(cmd, shell=True, check=False)
   if ret.returncode != 0:
-    logging.error(f'Failed to renew certificates; err: {ret.stderr}')
+    logging.error(f'[certbot] failed to renew certificates; err: {ret.stderr}')
     return False
 
   last_renewal = time.time()
 
   lf = '/var/log/letsencrypt/letsencrypt.log'
   if not os.path.isfile(lf):
-    logging.warning(f'Renewal succeded, but no log file at {lf}')
+    logging.warning(f'[certbot] renewal succeded, but no log file at {lf}')
     return False
 
   with open(lf, 'r') as f: logs = f.read().strip()
   if not 'no renewal failures' in logs:
-    logging.warning(f'Certificate renewal may have failed.')
+    logging.warning(f'[certbot] certificate renewal may have failed.')
+  else:
+    logging.info(f'[certbot] renewal completed')
 
+  logging.debug(f'[certbot] renewal log: {logs}')
   return True
 
 # Forked thread which runs indefinitely to renew certs.
@@ -369,18 +372,24 @@ def _certbot_thread():
   _certbot_renew()
 
   if len(new_certs) > 0:
-    logging.info(f'New certificates were generated: {new_certs}')
+    logging.info(f'[certbot] new certificates were generated: {new_certs}')
     _backup_certs()
 
+  logging.info(f'[certbot] beginning work loop')
   while _alive:
     elapsed = time.time() - last_renewal
+    logging.debug(f'[certbot] elapsed: {elapsed}')
     if elapsed < renewal_interval:
       time.sleep(10)
       continue
 
     if _certbot_renew():
       _backup_certs()
+      # Ugly. Restarts the container. But Envoy doesn't hot reload certificates easily.
+      logging.info(f'[certbot] restarting envoy.')
+      subprocess.run("pkill envoy", shell=True, check=False, capture_output=False)
 
+  logging.info(f'[certbot] _alive=False, exiting')
   sys.exit(0)
 
 if __name__ == "__main__":
@@ -395,6 +404,7 @@ if __name__ == "__main__":
     'admin_access_log': '',
     'dd_agent_host': '',
     's3_bucket': '',
+    'backup': 'letsencrypt',
     'concurrency': 0,
     'timeout': 15.0,
     'bind_address': '0.0.0.0',
@@ -641,13 +651,16 @@ if __name__ == "__main__":
         live_dir = os.path.join(f'{le_dir}/live', dname)
         if not os.path.isdir(live_dir): continue
 
-        logging.info(f'removing unused certificates for {dname}...')
+        logging.info(f'[certbot] removing unused certificates for {dname}...')
         shutil.rmtree(live_dir)
 
         cf = f'{le_dir}/renewal/{dname}.conf'
         if os.path.isfile(cf): os.remove(cf)
 
-    if os.fork() == 0: _certbot_thread()
+    logging.info('[certbot] forking')
+    if os.fork() == 0:
+      logging.info('[certbot] forked')
+      _certbot_thread()
 
   if cfg['concurrency'] > 0:
     envoy_flags += ['--concurrency', str(cfg['concurrency'])]
