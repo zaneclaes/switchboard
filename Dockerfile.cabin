@@ -1,0 +1,3 @@
+# Preserve the cabin runtime's Envoy, certificate tooling and LAN access controls.
+FROM docker.io/inzania/switchboard@sha256:48b7f6cf69badcb7b3e9772fc427a9a57b8db09fb76471c643b8feac7edf0b6f
+COPY bin/switchboard.py /usr/local/bin/switchboard.py

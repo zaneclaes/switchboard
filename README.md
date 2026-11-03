@@ -3,6 +3,17 @@
 
 A simple-to-configure front proxy in a docker container, built on Envoy.
 
+## Cabin runtime
+
+`Dockerfile.cabin` pins the deployed runtime image and replaces only `bin/switchboard.py`.
+The repository's historical Dockerfile predates that runtime's Envoy v3 and LAN controls.
+The script was recovered from deployed image
+`sha256:48b7f6cf69badcb7b3e9772fc427a9a57b8db09fb76471c643b8feac7edf0b6f`;
+its unmodified SHA256 was `c974ffce3a2fa07126c95e6f343da2a73ef24be621417a4c064f05694f81e4c8`.
+The wildcard change preserves those controls. Validate configuration with `VALIDATE_ONLY=true`
+in this runtime before deploying; that mode uses disposable certificates and Envoy's validator.
+`tests/test_wildcard.py` covers wildcard zones, invalid patterns and existing sharding.
+
 ## Features
 
 * GRPC (HTTP2.0) and WebSockets work side-by-side on the same paths with HTTP1.1
@@ -61,6 +72,14 @@ The schema may be `http`, `https`, `ws`, or `wss`. For secure schemas, adding a 
 This value may be empty if you do not wish to listen on a subdomain. You may also use the `?` suffix to listen on both the subdomain and the top level domain. For example, a value of `www?` would match for both `www.mydomain.com` and `mydomain.com`.
 
 ### Domain
+
+A complete `*` subdomain matches a wildcard zone, for example
+`wss!://*!:dev.chordzy.com@chordzy-dev`. The `!` after `*` disables any global
+shard for that route. Partial wildcards and optional wildcard/apex combinations
+are refused. Use a separate explicit route if the zone apex must also be served.
+TLS certificates are issued for the declared domain and its wildcard as usual.
+The original request authority is preserved for the downstream ingress to select
+an exact temporary service; an unmatched hostname must be refused downstream.
 
 The top-level domain name, such as `mydomain.com` or `some-domain.io`.
 
